@@ -1,34 +1,22 @@
-# Copilot (Omarchy plugin) — stub
+# Copilot (Omarchy plugin) — scaffold
 
-An early scaffold for an [Omarchy](https://omarchy.org) bar widget for the
-GitHub Copilot CLI, modeled on the structure of
+An [Omarchy](https://omarchy.org) bar widget for the GitHub Copilot CLI,
+modeled on the structure of
 [omarchy-tesla](https://github.com/nixfred/omarchy-tesla) and on
-[omarchy-antigravity](../omarchy-antigravity) (same author, same pattern —
-see that project's `findings.md`/`roadmap.md` for the research process this
-one will likely repeat).
+[omarchy-antigravity](../omarchy-antigravity) (same author, same pattern).
 
-Right now this only proves the plugin loads and shows a placeholder "GH"
-icon in the bar. No real data yet.
+**Read [`findings.md`](findings.md) first.** Short version: yes, Copilot's
+local data (`~/.cache/copilot/copilot-user-cache.json` for quota,
+`~/.copilot/session-store.db` for sessions/tokens) fits the built-in Agents
+panel's record contract almost exactly, confirmed by dropping a synthetic
+record into its usage dir and tracing the adoption path in
+`agents/Main.qml` — same method `omarchy-antigravity/roadmap.md` used, and
+it worked here too, with less uncertainty than Antigravity's case (no
+protobuf blobs, no unconfirmed quota RPC — the numbers are just sitting in
+plain JSON already).
 
-## Open questions before building the real thing
-
-- Does the Copilot CLI (`~/.local/share/gh/copilot`, or the mise-managed
-  `copilot` wrapper — see `omarchy-antigravity`'s sibling install notes,
-  both installed on this machine) write any local session/usage state to
-  disk, and where?
-- Is there a usage/rate-limit API comparable to Anthropic's OAuth usage
-  endpoint, or to what Antigravity's `RetrieveUserQuotaSummary` RPC turned
-  out to expose (see `omarchy-antigravity/roadmap.md`)?
-- **Worth checking first, before building a standalone widget at all:**
-  `omarchy-antigravity/roadmap.md` found that the built-in Agents bar plugin
-  (`omarchy.agents`, the one that already shows Claude Code/Codex/Fireworks)
-  accepts *any* provider — it just watches
-  `~/.local/state/omarchy/agents/usage/*.json` and has no allowlist. Dropping
-  a `copilot.json` record there and writing a small
-  `omarchy-agent-usage-copilot`-shaped collector might get Copilot a tab in
-  that existing panel for less work than a whole separate plugin. Confirm
-  this still holds before committing to the standalone-plugin path this repo
-  currently assumes.
+Right now `Panel.qml` only shows a placeholder "GH" bar icon. No real data
+collector yet — see `findings.md`, "Next steps".
 
 ## Dev loop
 
