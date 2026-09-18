@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "lasswellt.copilot",
+  "name": "Copilot",
+  "version": "0.1.0",
+  "author": "Tom Lasswell",
+  "description": "GitHub Copilot CLI status in the Omarchy bar. Stub: no real data wired up yet.",
+  "homepage": "https://github.com/lasswellt/omarchy-copilot",
+  "license": "MIT",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Copilot",
+    "description": "GitHub Copilot CLI status in the Omarchy bar. Stub: no real data wired up yet.",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {},
+    "schema": []
+  }
+}
