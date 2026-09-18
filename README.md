@@ -2,18 +2,15 @@
 
 An [Omarchy](https://omarchy.org) bar widget for the GitHub Copilot CLI,
 modeled on the structure of
-[omarchy-tesla](https://github.com/nixfred/omarchy-tesla) and on
-[omarchy-antigravity](../omarchy-antigravity) (same author, same pattern).
+[omarchy-tesla](https://github.com/nixfred/omarchy-tesla).
 
-**Read [`findings.md`](findings.md) first.** Short version: yes, Copilot's
-local data (`~/.cache/copilot/copilot-user-cache.json` for quota,
-`~/.copilot/session-store.db` for sessions/tokens) fits the built-in Agents
-panel's record contract almost exactly, confirmed by dropping a synthetic
-record into its usage dir and tracing the adoption path in
-`agents/Main.qml` — same method `omarchy-antigravity/roadmap.md` used, and
-it worked here too, with less uncertainty than Antigravity's case (no
-protobuf blobs, no unconfirmed quota RPC — the numbers are just sitting in
-plain JSON already).
+**Read [`findings.md`](findings.md) first.** Short version: Copilot's local
+data — `~/.cache/copilot/copilot-user-cache.json` for quota,
+`~/.copilot/session-store.db` for sessions and tokens — fits the built-in
+Agents panel's record contract almost exactly. Confirmed empirically by
+dropping a synthetic record into the panel's usage dir and tracing the
+adoption path in `agents/Main.qml`. The numbers are sitting in plain JSON
+already: no protobuf blobs to decode, no unconfirmed quota RPC.
 
 Right now `Panel.qml` only shows a placeholder "GH" bar icon. No real data
 collector yet — see `findings.md`, "Next steps".
@@ -22,7 +19,8 @@ collector yet — see `findings.md`, "Next steps".
 
 This directory is the source of truth. The installed copy at
 `~/.config/omarchy/plugins/lasswellt.copilot` is a separate git clone
-pulling from this repo (or its remote, once pushed).
+pulling from this repo's remote,
+<https://github.com/lasswellt/omarchy-copilot>.
 
 ```bash
 # after editing here
