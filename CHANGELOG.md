@@ -29,6 +29,8 @@ carried no data.
   client, and assert the token identity the mapping rests on against the real
   database when one is present.
 - `refreshIntervalSec` setting, read by both surfaces from one place.
+- `omarchy-shell lasswellt.copilot status` — the headline numbers as JSON,
+  off the record already in memory, for prompt segments and polling scripts.
 
 ### Fixed, versus the plan in `findings.md`
 

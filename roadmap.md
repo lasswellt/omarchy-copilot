@@ -460,6 +460,14 @@ already-loaded QML is not reloaded, and `omarchy-shell shell rescanPlugins`
 does not change that. The bar kept running the 0.1.0 stub and never started
 the newly declared service until `omarchy restart shell`.
 
+The registry's watcher is not the missing piece. `PluginRegistry.qml:665-680`
+runs `inotifywait -m -r` over the whole plugins directory and does emit
+`localPluginChanged`; the shell logs `Local plugin changed, reloading:
+lasswellt.copilot` on every update. It still does not re-read the QML.
+Tested head-on rather than inferred: an IPC method added to `Panel.qml`,
+committed, and pulled with `omarchy plugin update` was still "Function not
+found." eight seconds later, and answered immediately after a restart.
+
 The symptom is indistinguishable from a broken plugin, so test with a method
 only the new code has rather than one both versions share: `lasswellt.copilot
 toggle` answered fine from the *old* stub, while `lasswellt.copilot refresh`

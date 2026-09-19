@@ -100,7 +100,16 @@ copilot-usage-update --force     # ignore the scan cache
 copilot-usage-update --stdout    # print what it would publish
 
 omarchy-shell lasswellt.copilot toggle        # the panel
+omarchy-shell lasswellt.copilot status        # headline numbers as JSON
 omarchy-shell lasswellt.copilot.data refresh  # publish now, panel closed
+```
+
+`status` reads the record already in memory, so it costs nothing and never
+blocks — cheap enough for a prompt segment or a polling script:
+
+```console
+$ omarchy-shell lasswellt.copilot status | jq -r '"\(.percentUsed)% of \(.limit)"'
+1% of Premium requests
 ```
 
 ## Tests
@@ -131,12 +140,19 @@ omarchy plugin update lasswellt.copilot --yes
 omarchy restart shell
 ```
 
-That last line is not optional. `omarchy plugin update` pulls the files and
-the shell re-reads the manifest — `omarchy plugin list` will show the new
-`kinds` immediately — but QML that is already loaded stays loaded. Without a
-restart the bar keeps running the previous `Panel.qml` and never starts a
-newly declared service, which looks exactly like a plugin that does not work.
-Check with a method only the new code has:
+That last line is not optional, and it is worth knowing why. `omarchy plugin
+update` pulls the files, the shell re-reads the manifest — `omarchy plugin
+list` shows the new `kinds` at once — and the registry's `inotifywait` watcher
+does log `Local plugin changed, reloading: lasswellt.copilot`. None of that
+re-reads QML. Tested directly: a method added to `Panel.qml`, committed and
+pulled, was still "Function not found." eight seconds after the update, and
+appeared the moment the shell restarted. `omarchy-shell shell rescanPlugins`
+does not help either.
+
+So without a restart the bar keeps running the previous `Panel.qml` and never
+starts a newly declared service, which looks exactly like a plugin that does
+not work. Check with a method only the new code has — not one both versions
+share, since `toggle` answered fine from the old stub:
 
 ```bash
 omarchy-shell lasswellt.copilot refresh       # "Function not found." = still the old QML
