@@ -1,0 +1,482 @@
+#!/usr/bin/python3
+"""Contract tests for bin/copilot-usage.
+
+Every case runs the real collector as a subprocess against a generated
+COPILOT_HOME / COPILOT_CACHE_HOME, with tests/fake-copilot ahead of it on
+PATH so the JSON-RPC client is exercised rather than mocked. Nothing here
+touches the real home directory.
+
+    tests/run            # all cases
+    tests/run -v         # print each record
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+import fixtures  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent.parent
+COLLECTOR = ROOT / "bin" / "copilot-usage"
+FAKE_DIR = ROOT / "tests"
+VERBOSE = "-v" in sys.argv
+
+failures: list[str] = []
+passes = 0
+
+
+def check(name: str, condition: bool, detail: str = "") -> None:
+  global passes
+  if condition:
+    passes += 1
+  else:
+    failures.append(f"{name}{': ' + detail if detail else ''}")
+
+
+def run(home: Path, cache: Path | None = None, scenario: Path | None = None,
+        fake_exit: str | None = None, args: list[str] | None = None,
+        hang: bool = False, rpc_timeout: str | None = None) -> dict:
+  """Run the collector in isolation and return its record."""
+  env = dict(os.environ)
+  env["COPILOT_HOME"] = str(home)
+  env["COPILOT_CACHE_HOME"] = str(cache or (home / "nonexistent-cache"))
+  # A scan cache of its own, so one case never reads another's leftovers.
+  env["XDG_CACHE_HOME"] = str(home / "xdg-cache")
+  # The stub has to win over any real copilot on this machine.
+  env["PATH"] = str(FAKE_DIR / "bin") + os.pathsep + env.get("PATH", "")
+  if scenario:
+    env["FAKE_COPILOT_SCENARIO"] = str(scenario)
+  else:
+    env.pop("FAKE_COPILOT_SCENARIO", None)
+  if fake_exit:
+    env["FAKE_COPILOT_EXIT"] = fake_exit
+  else:
+    env.pop("FAKE_COPILOT_EXIT", None)
+  if hang:
+    env["FAKE_COPILOT_HANG"] = "1"
+  else:
+    env.pop("FAKE_COPILOT_HANG", None)
+  if rpc_timeout:
+    env["COPILOT_USAGE_RPC_TIMEOUT"] = rpc_timeout
+  else:
+    env.pop("COPILOT_USAGE_RPC_TIMEOUT", None)
+
+  proc = subprocess.run([sys.executable, str(COLLECTOR), *(args or [])],
+                        capture_output=True, text=True, env=env, timeout=60)
+  if VERBOSE and proc.stderr.strip():
+    print("  stderr:", proc.stderr.strip())
+  record = json.loads(proc.stdout)
+  if VERBOSE:
+    print("  " + json.dumps(record, indent=2).replace("\n", "\n  "))
+  return record
+
+
+# The collector looks up "copilot" on PATH, so the stub is installed under
+# that name in a directory the tests prepend.
+def install_stub() -> None:
+  stub_dir = FAKE_DIR / "bin"
+  stub_dir.mkdir(exist_ok=True)
+  target = stub_dir / "copilot"
+  # A real file, not a symlink: omarchy-plugin-validate refuses symlinks
+  # anywhere inside a plugin folder.
+  target.write_text(
+    "#!/bin/sh\nexec " + sys.executable + " " + str(FAKE_DIR / "fake-copilot") + " \"$@\"\n",
+    encoding="utf-8")
+  target.chmod(0o755)
+
+
+REQUIRED_KEYS = {
+  "aiCredits": dict,
+  "schemaVersion": int, "id": str, "name": str, "updatedAt": str,
+  "ready": bool, "hasLocalStats": bool, "hasPromptStats": bool,
+  "todayPrompts": int, "todaySessions": int, "todayTotalTokens": int,
+  "todayTokensByModel": dict, "recentDays": list,
+  "totalPrompts": int, "totalSessions": int, "activeDays": int,
+  "activeDates": list, "modelUsage": dict, "limits": list,
+  "tierLabel": str, "usageStatusText": str, "authHelpText": str,
+}
+
+
+def check_contract(name: str, record: dict) -> None:
+  """Every record, in every case, must satisfy the shape the panel reads."""
+  for key, kind in REQUIRED_KEYS.items():
+    check(f"{name}/has {key}", key in record)
+    if key in record:
+      check(f"{name}/{key} is {kind.__name__}", isinstance(record[key], kind),
+            f"got {type(record[key]).__name__}")
+  check(f"{name}/schemaVersion == 1", record.get("schemaVersion") == 1)
+  check(f"{name}/id == copilot", record.get("id") == "copilot",
+        "the filename in the usage dir is the agent id")
+  check(f"{name}/recentDays covers 7 days", len(record.get("recentDays", [])) == 7)
+  for day in record.get("recentDays", []):
+    check(f"{name}/recentDays entry shape",
+          isinstance(day, dict) and "date" in day and "messageCount" in day)
+  for model, bucket in record.get("modelUsage", {}).items():
+    check(f"{name}/modelUsage[{model}] buckets",
+          set(bucket) == {"inputTokens", "outputTokens",
+                          "cacheReadInputTokens", "cacheCreationInputTokens"},
+          str(sorted(bucket)))
+  for limit in record.get("limits", []):
+    check(f"{name}/limit shape", {"label", "percent", "resetsAt"} <= set(limit))
+    check(f"{name}/limit percent in range", 0.0 <= limit["percent"] <= 1.0,
+          str(limit["percent"]))
+  # A tab only appears when at least one of these is non-empty
+  # (agents/Main.qml providerHasData).
+  has_data = (record.get("totalPrompts") or record.get("totalSessions")
+              or record.get("activeDays") or record.get("todayPrompts")
+              or record.get("todaySessions") or record.get("limits"))
+  record["_hasData"] = bool(has_data)
+
+
+def main() -> int:
+  install_stub()
+  now = datetime.now()
+  today = now.strftime("%Y-%m-%d")
+  yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+  with tempfile.TemporaryDirectory() as tmpdir:
+    tmp = Path(tmpdir)
+
+    # ---------------------------------------------------------- happy path
+    #
+    # Two models, two sessions, three turns, one row landing yesterday.
+    # Timestamps are built from local wall-clock times so the day buckets
+    # hold in any timezone.
+    model_a, model_b = "gpt-5.6-terra", "claude-sonnet-5"
+    noon_today = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    noon_yesterday = noon_today - timedelta(days=1)
+    home = fixtures.build_home(
+      tmp / "happy",
+      sessions=[("s1", "first", fixtures.utc_stamp(noon_yesterday), fixtures.utc_stamp(noon_today)),
+                ("s2", "second", fixtures.utc_stamp(noon_today), fixtures.utc_stamp(noon_today)),
+                ("s3", "housekeeping only", fixtures.utc_stamp(noon_today), fixtures.utc_stamp(noon_today))],
+      turns=[("s1", 0, "hi", fixtures.utc_stamp(noon_yesterday)),
+             ("s2", 0, "hello", fixtures.utc_stamp(noon_today)),
+             ("s2", 1, "again", fixtures.utc_stamp(noon_today))],
+      events=[
+        # input_tokens is the inclusive total: 3 uncached + 15802 cache_write.
+        ("s1", model_a, 15805, 6, 0, 15802, 0,
+         fixtures.token_details(model_a, 3, 0, 15802, 6),
+         fixtures.utc_stamp(noon_yesterday), 2_500_000_000),
+        ("s2", model_a, 2200, 100, 2000, 100, 0,
+         fixtures.token_details(model_a, 100, 2000, 100, 100),
+         fixtures.utc_stamp(noon_today), 1_000_000_000),
+        ("s2", model_b, 500, 50, 0, 0, 20,
+         fixtures.token_details(model_b, 500, 0, 0, 50, reasoning=20),
+         fixtures.utc_stamp(noon_today), 500_000_000),
+      ])
+    scenario = fixtures.rpc_scenario(tmp / "happy.json")
+    record = run(home, scenario=scenario)
+    check_contract("happy", record)
+
+    check("happy/tierLabel", record["tierLabel"] == "Individual", record["tierLabel"])
+    check("happy/one limit drawn", len(record["limits"]) == 1,
+          "chat and completions are unlimited and must not draw meters")
+    limit = record["limits"][0]
+    check("happy/limit label", limit["label"] == "Premium requests", limit["label"])
+    check("happy/limit percent", limit["percent"] == 0.25, str(limit["percent"]))
+    check("happy/resetsAt is the reset date, not the snapshot time",
+          limit["resetsAt"] == "2026-10-01T00:00:00.000Z", limit["resetsAt"])
+
+    check("happy/totalPrompts", record["totalPrompts"] == 3, str(record["totalPrompts"]))
+    check("happy/todayPrompts", record["todayPrompts"] == 2, str(record["todayPrompts"]))
+    check("happy/totalSessions ignores empty sessions", record["totalSessions"] == 2,
+          f"{record['totalSessions']} (s3 has no turns and no usage)")
+    # s1's last activity was yesterday, so it is not a session today even
+    # though its updated_at is: a session counts for the day it was worked
+    # in, which is the day its turns and usage rows landed.
+    check("happy/todaySessions", record["todaySessions"] == 1, str(record["todaySessions"]))
+    check("happy/activeDates", record["activeDates"] == sorted([today, yesterday]),
+          str(record["activeDates"]))
+
+    # token_details_json is the authority, so input is the uncached 3, not
+    # the inclusive 15805; reasoning rides in the output bucket.
+    bucket_a = record["modelUsage"][model_a]
+    check("happy/inputTokens excludes cache", bucket_a["inputTokens"] == 103,
+          f"{bucket_a['inputTokens']} (3 yesterday + 100 today)")
+    check("happy/cacheCreationInputTokens", bucket_a["cacheCreationInputTokens"] == 15902,
+          str(bucket_a["cacheCreationInputTokens"]))
+    check("happy/cacheReadInputTokens", bucket_a["cacheReadInputTokens"] == 2000,
+          str(bucket_a["cacheReadInputTokens"]))
+    bucket_b = record["modelUsage"][model_b]
+    check("happy/reasoning lands in outputTokens", bucket_b["outputTokens"] == 70,
+          f"{bucket_b['outputTokens']} (50 output + 20 reasoning)")
+
+    today_total = sum(record["todayTokensByModel"].values())
+    check("happy/aiCredits rated from nano units",
+          record["aiCredits"] == {"today": 1.5, "total": 4.0},
+          json.dumps(record["aiCredits"]))
+    check("happy/todayTotalTokens agrees with by-model", record["todayTotalTokens"] == today_total,
+          f"{record['todayTotalTokens']} vs {today_total}")
+    recent = {day["date"]: day["messageCount"] for day in record["recentDays"]}
+    check("happy/recentDays carries today's tokens", recent.get(today) == record["todayTotalTokens"],
+          f"{recent.get(today)} vs {record['todayTotalTokens']}")
+    check("happy/recentDays carries yesterday", recent.get(yesterday) == 15811,
+          str(recent.get(yesterday)))
+
+    # ------------------------------------------- flat columns, no details
+    home = fixtures.build_home(
+      tmp / "nodetails",
+      sessions=[("s1", "x", fixtures.utc_stamp(noon_today), fixtures.utc_stamp(noon_today))],
+      turns=[("s1", 0, "hi", fixtures.utc_stamp(noon_today))],
+      events=[("s1", model_a, 15805, 6, 0, 15802, 0, None, fixtures.utc_stamp(noon_today))])
+    record = run(home, scenario=scenario)
+    check_contract("nodetails", record)
+    bucket = record["modelUsage"][model_a]
+    check("nodetails/falls back to subtraction", bucket["inputTokens"] == 3,
+          f"{bucket['inputTokens']} (15805 - 0 - 15802)")
+
+    # A details blob that is not JSON must not take the row, or the run, down.
+    home = fixtures.build_home(
+      tmp / "baddetails",
+      sessions=[("s1", "x", fixtures.utc_stamp(noon_today), fixtures.utc_stamp(noon_today))],
+      turns=[("s1", 0, "hi", fixtures.utc_stamp(noon_today))],
+      events=[("s1", model_a, 15805, 6, 0, 15802, 0, "{not json", fixtures.utc_stamp(noon_today))])
+    record = run(home, scenario=scenario)
+    check_contract("baddetails", record)
+    check("baddetails/still counts the row",
+          record["modelUsage"][model_a]["inputTokens"] == 3,
+          str(record["modelUsage"][model_a]["inputTokens"]))
+
+    # ------------------------------------------------- no database at all
+    home = fixtures.build_home(tmp / "nodb", with_db=False)
+    record = run(home, scenario=scenario)
+    check_contract("nodb", record)
+    check("nodb/no local numbers", record["totalPrompts"] == 0 and record["totalSessions"] == 0)
+    check("nodb/limits still arrive", len(record["limits"]) == 1)
+    check("nodb/tab still appears", record["_hasData"],
+          "a limit alone is enough for providerHasData")
+
+    # ------------------------------------------------------- empty database
+    home = fixtures.build_home(tmp / "emptydb")
+    record = run(home, scenario=scenario)
+    check_contract("emptydb", record)
+    check("emptydb/zeroed", record["todayTotalTokens"] == 0 and record["modelUsage"] == {})
+    check("emptydb/aiCredits zeroed", record["aiCredits"] == {"today": 0.0, "total": 0.0},
+          json.dumps(record["aiCredits"]))
+
+    # A row Copilot never rated must not poison the credit total.
+    home = fixtures.build_home(
+      tmp / "nonano",
+      sessions=[("s1", "x", fixtures.utc_stamp(noon_today), fixtures.utc_stamp(noon_today))],
+      turns=[("s1", 0, "hi", fixtures.utc_stamp(noon_today))],
+      events=[("s1", model_a, 100, 10, 0, 0, 0,
+               fixtures.token_details(model_a, 100, 0, 0, 10), fixtures.utc_stamp(noon_today))])
+    record = run(home, scenario=scenario)
+    check_contract("nonano", record)
+    check("nonano/unrated rows count as zero credits",
+          record["aiCredits"] == {"today": 0.0, "total": 0.0},
+          json.dumps(record["aiCredits"]))
+
+    # ------------------------------------------------ RPC cannot even start
+    home = fixtures.build_home(
+      tmp / "norpc",
+      sessions=[("s1", "x", fixtures.utc_stamp(noon_today), fixtures.utc_stamp(noon_today))],
+      turns=[("s1", 0, "hi", fixtures.utc_stamp(noon_today))],
+      events=[("s1", model_a, 100, 10, 0, 0, 0,
+               fixtures.token_details(model_a, 100, 0, 0, 10), fixtures.utc_stamp(noon_today))])
+    record = run(home, fake_exit="1")
+    check_contract("norpc", record)
+    check("norpc/local stats survive", record["totalPrompts"] == 1)
+    check("norpc/ready stays true", record["ready"] is True,
+          "local numbers are real even with no runtime")
+    check("norpc/no limits", record["limits"] == [])
+    check("norpc/says so", record["usageStatusText"] != "")
+    check("norpc/advises a retry", record["retryAdvised"] is True)
+
+    # ------------------------------------- RPC down, but the cache is there
+    cache = fixtures.build_cache(tmp / "cache", percent_remaining=80.0, extra_entry=True)
+    record = run(home, cache=cache, fake_exit="1")
+    check_contract("cachefallback", record)
+    check("cachefallback/limits from cache", len(record["limits"]) == 1)
+    check("cachefallback/newest entry wins",
+          record["limits"] and record["limits"][0]["percent"] == 0.2,
+          str(record["limits"][0]["percent"]) if record["limits"] else "none")
+    check("cachefallback/resetsAt from cache",
+          record["limits"][0]["resetsAt"] == "2026-10-01T00:00:00.000Z")
+    check("cachefallback/tier from cache", record["tierLabel"] == "Individual")
+    check("cachefallback/labelled as cached", record["usageStatusText"] == "Quota from cache",
+          record["usageStatusText"])
+
+    # ----------------------------------------------------------- signed out
+    scenario_out = fixtures.rpc_scenario(tmp / "signedout.json", signed_out=True)
+    record = run(home, scenario=scenario_out)
+    check_contract("signedout", record)
+    check("signedout/no limits", record["limits"] == [])
+    check("signedout/status", record["usageStatusText"] == "Copilot signed out",
+          record["usageStatusText"])
+    check("signedout/tells you what to run", "copilot login" in record["authHelpText"],
+          record["authHelpText"])
+    check("signedout/local stats survive", record["totalPrompts"] == 1)
+
+    # ------------------------------------------------ quota call itself errors
+    scenario_err = fixtures.rpc_scenario(tmp / "quotaerr.json", quota_error="upstream unavailable")
+    record = run(home, scenario=scenario_err)
+    check_contract("quotaerror", record)
+    check("quotaerror/no limits", record["limits"] == [])
+    check("quotaerror/advises a retry", record["retryAdvised"] is True)
+    check("quotaerror/reports the message", "upstream unavailable" in record["authHelpText"],
+          record["authHelpText"])
+
+    # ------------------------- a runtime that starts and then says nothing
+    #
+    # The failure mode the select-based deadline exists for: without it the
+    # collector blocks forever, and the service spawns another one every
+    # refresh interval.
+    started = time.monotonic()
+    record = run(home, hang=True, rpc_timeout="2")
+    elapsed = time.monotonic() - started
+    check_contract("hang", record)
+    check("hang/gives up on the deadline", elapsed < 20, f"took {elapsed:.1f}s")
+    check("hang/local stats survive", record["totalPrompts"] == 1)
+    check("hang/no limits", record["limits"] == [])
+    check("hang/advises a retry", record["retryAdvised"] is True)
+
+    # ------------------------------- a runtime that refuses the handshake
+    #
+    # connect is only mandatory behind COPILOT_CONNECTION_TOKEN, and 1.0.86
+    # serves the following calls after refusing a wrong-shaped clientInfo.
+    # A future runtime tightening that schema must not cost us the quota.
+    scenario_noconnect = fixtures.rpc_scenario(tmp / "noconnect.json")
+    payload = json.loads(scenario_noconnect.read_text())
+    payload["connect"] = {"__error__": "unknown field `name`"}
+    scenario_noconnect.write_text(json.dumps(payload))
+    record = run(home, scenario=scenario_noconnect)
+    check_contract("noconnect", record)
+    check("noconnect/quota still arrives", len(record["limits"]) == 1,
+          "a refused handshake must not cost the quota")
+    check("noconnect/no false alarm", record["usageStatusText"] == "",
+          record["usageStatusText"])
+
+    # ------------------------------------------- every quota is unlimited
+    scenario_unl = fixtures.rpc_scenario(tmp / "unlimited.json", snapshots={
+      "chat": {"isUnlimitedEntitlement": True, "entitlementRequests": -1,
+               "usedRequests": 0, "remainingPercentage": 100, "overage": 0,
+               "usageAllowedWithExhaustedQuota": True, "overageAllowedWithExhaustedQuota": True},
+    })
+    record = run(home, scenario=scenario_unl)
+    check_contract("unlimited", record)
+    check("unlimited/draws no meter", record["limits"] == [],
+          "a meter pinned at zero is noise")
+
+    # The cache holds a capped premium_interactions bucket. A live answer of
+    # "everything is unlimited" is the truth and must win over it — falling
+    # back on empty limits alone would resurrect a stale meter here.
+    record = run(home, cache=cache, scenario=scenario_unl)
+    check_contract("unlimited+cache", record)
+    check("unlimited+cache/live answer wins over the cache",
+          record["limits"] == [], json.dumps(record["limits"]))
+    check("unlimited+cache/not labelled as cached", record["usageStatusText"] == "",
+          record["usageStatusText"])
+
+    # Signed out is also an answer: cached quota from a previous account is
+    # worse than none.
+    record = run(home, cache=cache, scenario=scenario_out)
+    check_contract("signedout+cache", record)
+    check("signedout+cache/no resurrected meter", record["limits"] == [],
+          json.dumps(record["limits"]))
+
+    # But a runtime that never answered still falls back.
+    record = run(home, cache=cache, fake_exit="1")
+    check("norpc+cache/still falls back", record["usageStatusText"] == "Quota from cache",
+          record["usageStatusText"])
+
+    # And the internal marker never reaches the record.
+    check("contract/no private fields leak",
+          not any(key.startswith("_") and key != "_hasData" for key in record),
+          str([k for k in record if k.startswith("_")]))
+
+    # ------------------------------------------------ an unknown plan slug
+    scenario_plan = fixtures.rpc_scenario(tmp / "plan.json", plan="enterprise_seat")
+    record = run(home, scenario=scenario_plan)
+    check("plan/humanizes unknown slugs", record["tierLabel"] == "Enterprise Seat",
+          record["tierLabel"])
+
+    # ------------------------------------------- an exhausted premium quota
+    scenario_full = fixtures.rpc_scenario(tmp / "full.json", snapshots={
+      "premium_interactions": {"isUnlimitedEntitlement": False, "entitlementRequests": 1500,
+                               "usedRequests": 1500, "remainingPercentage": 0, "overage": 0,
+                               "usageAllowedWithExhaustedQuota": False,
+                               "overageAllowedWithExhaustedQuota": False},
+    })
+    record = run(home, scenario=scenario_full)
+    check_contract("exhausted", record)
+    check("exhausted/percent is 1.0", record["limits"][0]["percent"] == 1.0,
+          str(record["limits"][0]["percent"]))
+
+    # ------------------------------------------------------- flag handling
+    for flag in ("--force", "--limits-only"):
+      record = run(home, scenario=scenario, args=[flag])
+      check_contract(f"flag{flag}", record)
+      check(f"flag{flag}/still emits limits", len(record["limits"]) == 1)
+
+    # ------------------ the day boundary, from the far side of local midnight
+    #
+    # 00:30 local is the previous UTC day east of Greenwich and the same one
+    # west of it. Either way it belongs to today locally.
+    just_after_midnight = now.replace(hour=0, minute=30, second=0, microsecond=0)
+    home = fixtures.build_home(
+      tmp / "midnight",
+      sessions=[("s1", "x", fixtures.utc_stamp(just_after_midnight),
+                 fixtures.utc_stamp(just_after_midnight))],
+      turns=[("s1", 0, "hi", fixtures.utc_stamp(just_after_midnight))],
+      events=[("s1", model_a, 100, 10, 0, 0, 0,
+               fixtures.token_details(model_a, 100, 0, 0, 10),
+               fixtures.utc_stamp(just_after_midnight))])
+    record = run(home, scenario=scenario)
+    check_contract("midnight", record)
+    check("midnight/buckets by local day, not UTC", record["todayPrompts"] == 1,
+          f"todayPrompts={record['todayPrompts']}, activeDates={record['activeDates']}")
+    check("midnight/today's tokens counted", record["todayTotalTokens"] == 110,
+          str(record["todayTotalTokens"]))
+
+    # --------------------------------- the identity this collector rests on
+    #
+    # Against the real database when there is one: input_tokens is the
+    # inclusive total, and token_details_json holds the disjoint parts. If
+    # Copilot ever changes that, split_tokens() starts lying and this is
+    # where it shows up.
+    real_db = Path(os.environ.get("COPILOT_HOME") or (Path.home() / ".copilot")) / "session-store.db"
+    if real_db.is_file():
+      import sqlite3
+      conn = sqlite3.connect(real_db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+      try:
+        rows = conn.execute(
+          "SELECT id, input_tokens, token_details_json FROM assistant_usage_events"
+          " WHERE token_details_json IS NOT NULL").fetchall()
+      finally:
+        conn.close()
+      checked = 0
+      for row_id, inclusive, raw in rows:
+        try:
+          parts = {e["tokenType"]: e["tokenCount"] for e in json.loads(raw)}
+        except Exception:
+          continue
+        total = parts.get("input", 0) + parts.get("cache_read", 0) + parts.get("cache_write", 0)
+        check(f"identity/row {row_id}", int(inclusive or 0) == total,
+              f"input_tokens={inclusive} but details sum to {total}")
+        checked += 1
+      print(f"  (identity checked against {checked} real rows)")
+    else:
+      print("  (no real session-store.db; identity check skipped)")
+
+  print()
+  if failures:
+    print(f"FAIL — {len(failures)} of {len(failures) + passes} checks")
+    for failure in failures:
+      print("  ✗ " + failure)
+    return 1
+  print(f"ok — {passes} checks")
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

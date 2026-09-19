@@ -1,0 +1,799 @@
+#!/usr/bin/python3
+# copilot-usage: print the GitHub Copilot usage record as JSON.
+#
+# Emits the same display-ready record contract the first-party
+# omarchy-agent-usage-* collectors print, so the Agents panel adopts it as
+# ~/.local/state/omarchy/agents/usage/copilot.json and our own Panel.qml can
+# read the identical file. See ../roadmap.md for how every field below was
+# derived and which of them came from a live probe.
+#
+# Two sources, deliberately:
+#
+#   limits + tier + sign-in   the CLI's own JSON-RPC server, started as
+#                             `copilot --headless --no-auto-update --stdio`.
+#                             Authoritative and account-wide.
+#   tokens, prompts, sessions COPILOT_HOME/session-store.db, read-only.
+#                             Machine-local.
+#
+# The cache file the CLI writes for itself (COPILOT_CACHE_HOME/
+# copilot-user-cache.json) is the fallback for when the RPC will not start.
+# It is stale between CLI runs — measurably so — and it is JSONC, not JSON.
+#
+# COPILOT_HOME and COPILOT_CACHE_HOME are the CLI's own overrides and are
+# honored here, the way the Claude collector honors CLAUDE_CONFIG_DIR, so the
+# tests can point this at a fixture tree instead of the real home directory.
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import select
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+AGENT_ID = "copilot"
+AGENT_NAME = "Copilot"
+AUTH_HELP = "Run `copilot login` to authenticate."
+
+# A scan this recent is only reused to dedup concurrent collector runs (our
+# service timer and a manual run can overlap); every periodic refresh lands a
+# real rescan. --limits-only promises only fresh limits, so it may reuse a
+# scan for far longer. Both windows match the Codex collector's.
+SCAN_REUSE_SECONDS = 20
+LIMITS_ONLY_REUSE_SECONDS = 900
+
+# Budget for the whole RPC exchange: spawn, connect, two calls, shutdown.
+# Measured at ~1.5s; this is the "something is wrong" bound, not a target.
+# The override exists so the tests can exercise the timeout without waiting
+# it out; nothing in normal operation sets it.
+def rpc_timeout_seconds() -> float:
+  try:
+    configured = float(os.environ.get("COPILOT_USAGE_RPC_TIMEOUT", ""))
+  except ValueError:
+    return 12.0
+  return configured if configured > 0 else 12.0
+
+# Display names for the quota buckets GitHub reports. Anything not listed
+# falls back to the id with underscores turned into spaces, so a bucket
+# added server-side still draws a meter with a readable label.
+QUOTA_LABELS = {
+  "premium_interactions": "Premium requests",
+  "chat": "Chat",
+  "completions": "Completions",
+}
+
+# copilot_plan slugs seen in the CLI's own UI code, plus the obvious rest.
+PLAN_LABELS = {
+  "individual": "Individual",
+  "free": "Free",
+  "pro": "Pro",
+  "pro_plus": "Pro+",
+  "edu": "Education",
+  "business": "Business",
+  "enterprise": "Enterprise",
+}
+
+
+# ----------------------------------------------------------------- helpers
+
+
+def copilot_home() -> Path:
+  return Path(os.environ.get("COPILOT_HOME") or (Path.home() / ".copilot"))
+
+
+def copilot_cache_home() -> Path:
+  return Path(os.environ.get("COPILOT_CACHE_HOME") or (Path.home() / ".cache" / "copilot"))
+
+
+def number(value: Any) -> int:
+  try:
+    return max(0, int(value or 0))
+  except (TypeError, ValueError):
+    return 0
+
+
+def runtime_env() -> dict[str, str]:
+  # The shell launches us from a Quickshell process whose PATH is whatever
+  # the session started with; the CLI usually lives in one of these.
+  home = str(Path.home())
+  parts = [
+    os.environ.get("PATH", ""),
+    f"{home}/.local/bin",
+    f"{home}/.npm-global/bin",
+    f"{home}/.local/share/mise/shims",
+  ]
+  env = os.environ.copy()
+  env["PATH"] = os.pathsep.join(part for part in parts if part)
+  return env
+
+
+ENV = runtime_env()
+
+
+def find_copilot() -> str | None:
+  return shutil.which("copilot", path=ENV.get("PATH"))
+
+
+now = datetime.now()
+today = now.strftime("%Y-%m-%d")
+recent_dates = [(now - timedelta(days=offset)).strftime("%Y-%m-%d") for offset in range(6, -1, -1)]
+
+
+def local_day(value: Any) -> str:
+  """The local calendar day a stored timestamp falls on.
+
+  session-store.db writes ISO-8601 with a trailing Z even though the column
+  default is datetime('now'), and both forms mean UTC. Doing this in SQLite
+  instead would file an evening's work under the wrong day west of
+  Greenwich, because date() and date('now') are both UTC.
+  """
+  text = str(value or "").strip()
+  if not text:
+    return today
+  try:
+    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+  except ValueError:
+    try:
+      parsed = datetime.fromisoformat(text[:19])
+    except ValueError:
+      return today
+  if parsed.tzinfo is None:
+    parsed = parsed.replace(tzinfo=timezone.utc)
+  return parsed.astimezone().strftime("%Y-%m-%d")
+
+
+def empty_bucket() -> dict[str, int]:
+  return {
+    "inputTokens": 0,
+    "outputTokens": 0,
+    "cacheReadInputTokens": 0,
+    "cacheCreationInputTokens": 0,
+  }
+
+
+def empty_stats() -> dict[str, Any]:
+  return {
+    "todayPrompts": 0,
+    "todaySessions": 0,
+    "todayTotalTokens": 0,
+    "todayTokensByModel": {},
+    "recentDays": [{"date": day, "messageCount": 0} for day in recent_dates],
+    "totalPrompts": 0,
+    "totalSessions": 0,
+    "activeDays": 0,
+    "activeDates": [],
+    "modelUsage": {},
+    "aiCredits": {"today": 0.0, "total": 0.0},
+  }
+
+
+# ------------------------------------------------------------------ tokens
+
+
+def split_tokens(row: dict[str, Any]) -> tuple[int, int, int, int]:
+  """The four record-contract buckets for one assistant_usage_events row.
+
+  token_details_json is the authority: it carries one disjoint entry per
+  token type, and its counts are what total_nano_aiu is rated from. The flat
+  columns are *inclusive* totals — a live row reads input_tokens 15805 for a
+  request whose details say 3 uncached input and 15802 cache_write — so
+  reading them as if they were disjoint counts the cache twice.
+
+  Reasoning tokens ride in the output bucket, which the record contract has
+  no separate slot for. In the details path they are a disjoint entry and so
+  are added; in the fallback path output_tokens is assumed inclusive of them
+  by the same symmetry that makes input_tokens inclusive. If a row ever
+  shows details whose types do not sum to the flat columns, the details win.
+  """
+  details: Any = None
+  raw = row.get("token_details_json")
+  if raw:
+    try:
+      details = json.loads(raw)
+    except (TypeError, ValueError):
+      details = None
+
+  if isinstance(details, list) and details:
+    by_type: dict[str, int] = {}
+    for entry in details:
+      if not isinstance(entry, dict):
+        continue
+      key = str(entry.get("tokenType") or "")
+      if key:
+        by_type[key] = by_type.get(key, 0) + number(entry.get("tokenCount"))
+    if by_type:
+      return (
+        by_type.get("input", 0),
+        by_type.get("output", 0) + by_type.get("reasoning", 0),
+        by_type.get("cache_read", 0),
+        by_type.get("cache_write", 0),
+      )
+
+  cache_read = number(row.get("cache_read_tokens"))
+  cache_write = number(row.get("cache_write_tokens"))
+  uncached = max(0, number(row.get("input_tokens")) - cache_read - cache_write)
+  return uncached, number(row.get("output_tokens")), cache_read, cache_write
+
+
+# --------------------------------------------------------------- local scan
+
+
+def scan_database(db: Path) -> tuple[dict[str, Any], bool]:
+  """Roll session-store.db up into the record's stats fields.
+
+  Returns the stats and whether the scan ran to completion: a scan cut short
+  by a database error still contributes what it read, but must not be cached
+  as if it were the whole story.
+  """
+  stats = empty_stats()
+  if not db.is_file():
+    return stats, True
+
+  recent = {day: 0 for day in recent_dates}
+  today_by_model: dict[str, int] = {}
+  model_usage: dict[str, dict[str, int]] = {}
+  active_days: set[str] = set()
+  sessions: set[str] = set()
+  today_sessions: set[str] = set()
+  today_total = 0
+  total_prompts = 0
+  today_prompts = 0
+  today_nano_aiu = 0
+  total_nano_aiu = 0
+
+  try:
+    # Read-only, and never a writer: Copilot may be mid-turn right now. The
+    # database is WAL, so SQLite still creates the -shm/-wal sidecars beside
+    # it to read — same user, same directory, and Copilot's own to clean up.
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+  except sqlite3.Error:
+    return stats, False
+
+  try:
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only = ON")
+
+    for row in conn.execute(
+      "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens,"
+      " cache_write_tokens, token_details_json, total_nano_aiu, created_at"
+      " FROM assistant_usage_events"
+    ):
+      entry = dict(row)
+      day = local_day(entry.get("created_at"))
+      model = str(entry.get("model") or "copilot")
+      session_id = str(entry.get("session_id") or "")
+      inp, out, cache_read, cache_write = split_tokens(entry)
+      total = inp + out + cache_read + cache_write
+
+      bucket = model_usage.setdefault(model, empty_bucket())
+      bucket["inputTokens"] += inp
+      bucket["outputTokens"] += out
+      bucket["cacheReadInputTokens"] += cache_read
+      bucket["cacheCreationInputTokens"] += cache_write
+
+      nano_aiu = number(entry.get("total_nano_aiu"))
+      total_nano_aiu += nano_aiu
+
+      if session_id:
+        sessions.add(session_id)
+      if total > 0:
+        active_days.add(day)
+      if day in recent:
+        recent[day] += total
+      if day == today:
+        today_total += total
+        today_nano_aiu += nano_aiu
+        if total > 0:
+          today_by_model[model] = today_by_model.get(model, 0) + total
+        if session_id:
+          today_sessions.add(session_id)
+
+    # One turn is one thing the user asked for, which is what every other
+    # collector means by a prompt. Copilot records them outright, so this
+    # record does not need the hasPromptStats escape hatch.
+    for row in conn.execute("SELECT session_id, timestamp FROM turns"):
+      entry = dict(row)
+      day = local_day(entry.get("timestamp"))
+      session_id = str(entry.get("session_id") or "")
+      total_prompts += 1
+      active_days.add(day)
+      if session_id:
+        sessions.add(session_id)
+      if day == today:
+        today_prompts += 1
+        if session_id:
+          today_sessions.add(session_id)
+  except sqlite3.Error:
+    # Transient lock, a schema migration, corruption: the numbers stop here,
+    # incomplete. Serve what we read, cache none of it.
+    return stats, False
+  finally:
+    conn.close()
+
+  stats.update({
+    "todayPrompts": today_prompts,
+    "todaySessions": len(today_sessions),
+    "todayTotalTokens": today_total,
+    "todayTokensByModel": today_by_model,
+    "recentDays": [{"date": day, "messageCount": recent[day]} for day in recent_dates],
+    "totalPrompts": total_prompts,
+    # Sessions that actually did something. The table also holds
+    # housekeeping rows with no turns and no usage, which are not sessions
+    # anyone had.
+    "totalSessions": len(sessions),
+    "activeDays": len(active_days),
+    "activeDates": sorted(active_days),
+    "modelUsage": model_usage,
+    # Beyond the record contract, and ignored by the built-in Agents panel,
+    # which reads only the fields it knows. Copilot rates every call in
+    # nano-AI-units, and its own UI divides by 1e9 and calls the result "AI
+    # credits" — a real cost figure no other agent on this machine reports.
+    # This plugin's own panel shows it; nothing depends on it.
+    "aiCredits": {
+      "today": round(today_nano_aiu / 1e9, 4),
+      "total": round(total_nano_aiu / 1e9, 4),
+    },
+  })
+  return stats, True
+
+
+# -------------------------------------------------------------- scan cache
+
+
+def cache_root() -> Path:
+  root = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omarchy" / "agent-usage"
+  root.mkdir(parents=True, exist_ok=True)
+  return root
+
+
+def scan_cache_paths(db: Path) -> tuple[Path, Path]:
+  digest = hashlib.sha1(str(db).encode("utf-8")).hexdigest()[:16]
+  root = cache_root()
+  return root / f"copilot-scan-{digest}.json", root / f"copilot-scan-{digest}.lock"
+
+
+def read_fresh_json(path: Path, max_age_seconds: float) -> Any:
+  if max_age_seconds <= 0 or not path.exists():
+    return None
+  try:
+    # A negative age means the mtime is in the future: the clock moved
+    # backwards since the write, so the cache's freshness cannot be trusted.
+    age = time.time() - path.stat().st_mtime
+    if 0 <= age <= max_age_seconds:
+      return json.loads(path.read_text(encoding="utf-8"))
+  except Exception:
+    return None
+  return None
+
+
+def write_json(path: Path, payload: Any) -> None:
+  # A temp name unique to this writer, not derived from the target: two
+  # collectors can run at once, and a shared temp path means the second
+  # replace finds the first one's file already moved away.
+  handle_fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+  tmp = Path(tmp_name)
+  try:
+    with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+      handle.write(json.dumps(payload, separators=(",", ":")) + "\n")
+    tmp.chmod(0o644)
+    tmp.replace(path)
+  except BaseException:
+    tmp.unlink(missing_ok=True)
+    raise
+
+
+def read_cached_stats(cache_file: Path, max_age_seconds: float) -> dict[str, Any] | None:
+  cached = read_fresh_json(cache_file, max_age_seconds)
+  if not isinstance(cached, dict) or cached.get("schemaVersion") != 1:
+    return None
+  # today* fields only mean "today" on the day they were scanned. A cache
+  # from another local date is a miss, not merely old, whatever its mtime.
+  if cached.get("scanDate") != today:
+    return None
+  stats = cached.get("stats")
+  if not isinstance(stats, dict):
+    return None
+  if not all(key in stats for key in ("todayPrompts", "todayTotalTokens", "recentDays", "activeDates", "modelUsage")):
+    return None
+  return stats
+
+
+def cached_local_stats(db: Path, max_age: float) -> dict[str, Any]:
+  """Local stats, with the cache as a pure optimization.
+
+  Any cache-layer failure degrades to a direct scan and a warning on stderr.
+  The JSON record is the contract; the cache is not.
+  """
+  try:
+    cache_file, lock_file = scan_cache_paths(db)
+    cached = read_cached_stats(cache_file, max_age)
+    if cached is not None:
+      return cached
+    with lock_file.open("w") as lock:
+      fcntl.flock(lock, fcntl.LOCK_EX)
+      cached = read_cached_stats(cache_file, max_age)
+      if cached is not None:
+        return cached
+      stats, complete = scan_database(db)
+      if complete:
+        try:
+          write_json(cache_file, {"schemaVersion": 1, "scanDate": today, "stats": stats})
+        except Exception as exc:
+          print(f"copilot-usage: could not write usage cache ({exc})", file=sys.stderr)
+      return stats
+  except Exception as exc:
+    print(f"copilot-usage: cache unavailable ({exc}); scanning directly", file=sys.stderr)
+    return scan_database(db)[0]
+
+
+# --------------------------------------------------------------------- RPC
+
+
+class RpcError(Exception):
+  pass
+
+
+class CopilotRpc:
+  """A JSON-RPC 2.0 client for `copilot --headless --no-auto-update --stdio`.
+
+  The framing is vscode-jsonrpc's: LSP-style Content-Length headers around
+  each message. The `connect` handshake is only mandatory when the server
+  was started with COPILOT_CONNECTION_TOKEN, but it is one round trip and it
+  is how the runtime learns who is asking, so it is always sent.
+  """
+
+  def __init__(self, command: str, deadline: float):
+    self.deadline = deadline
+    self.proc = subprocess.Popen(
+      [command, "--headless", "--no-auto-update", "--stdio"],
+      stdin=subprocess.PIPE,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.DEVNULL,
+      env=ENV,
+    )
+    self.next_id = 0
+
+  def _send(self, method: str, params: Any) -> int:
+    self.next_id += 1
+    message: dict[str, Any] = {"jsonrpc": "2.0", "id": self.next_id, "method": method}
+    if params is not None:
+      message["params"] = params
+    body = json.dumps(message).encode("utf-8")
+    assert self.proc.stdin is not None
+    self.proc.stdin.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    self.proc.stdin.flush()
+    return self.next_id
+
+  def _read_exact(self, count: int) -> bytes:
+    assert self.proc.stdout is not None
+    chunks = b""
+    while len(chunks) < count:
+      # select, not a bare read: a runtime that starts but never answers
+      # would otherwise block this process forever, and the service respawns
+      # it every refresh interval. The deadline has to be enforced while
+      # waiting for bytes, not only between them.
+      remaining = self.deadline - time.monotonic()
+      if remaining <= 0:
+        raise RpcError("timed out reading from the Copilot runtime")
+      if not select.select([self.proc.stdout], [], [], remaining)[0]:
+        raise RpcError("timed out reading from the Copilot runtime")
+      chunk = self.proc.stdout.read1(count - len(chunks))
+      if not chunk:
+        raise RpcError("the Copilot runtime closed the connection")
+      chunks += chunk
+    return chunks
+
+  def _read_message(self) -> dict[str, Any]:
+    header = b""
+    while not header.endswith(b"\r\n\r\n"):
+      if time.monotonic() > self.deadline:
+        raise RpcError("timed out waiting for the Copilot runtime")
+      header += self._read_exact(1)
+    length = 0
+    for line in header.decode("ascii", "replace").split("\r\n"):
+      if line.lower().startswith("content-length:"):
+        try:
+          length = int(line.split(":", 1)[1].strip())
+        except ValueError as exc:
+          raise RpcError("malformed Content-Length from the Copilot runtime") from exc
+    if length <= 0:
+      raise RpcError("missing Content-Length from the Copilot runtime")
+    try:
+      return json.loads(self._read_exact(length))
+    except ValueError as exc:
+      raise RpcError("malformed JSON from the Copilot runtime") from exc
+
+  def call(self, method: str, params: Any = None) -> Any:
+    request_id = self._send(method, params)
+    while True:
+      message = self._read_message()
+      # Notifications and responses to other ids share the stream; only the
+      # answer to this request ends the wait.
+      if message.get("id") != request_id:
+        continue
+      if "error" in message:
+        error = message["error"] or {}
+        raise RpcError(str(error.get("message") or "the Copilot runtime refused the request"))
+      return message.get("result")
+
+  def close(self) -> None:
+    try:
+      self.call("runtime.shutdown", {})
+    except Exception:
+      pass
+    for step in (self.proc.terminate, self.proc.kill):
+      try:
+        step()
+        self.proc.wait(timeout=2)
+        return
+      except Exception:
+        continue
+
+
+def fetch_rpc() -> dict[str, Any]:
+  """Sign-in, plan, and quota, from the CLI's own runtime.
+
+  Returns the record fields it owns. usedRequests and the quota percentages
+  are account-wide — they count what the IDE and every other machine spent
+  too — which is why they belong in `limits` and never in the local stats.
+  """
+  result: dict[str, Any] = {
+    "limits": [],
+    "tierLabel": "",
+    "usageStatusText": "",
+    "authHelpText": "",
+    "retryAdvised": False,
+    # Stripped before the record is printed. An empty `limits` means two
+    # very different things — "the runtime never answered" and "this account
+    # has no capped quota" — and only the first is a reason to fall back to
+    # the cache.
+    "_answered": False,
+  }
+
+  command = find_copilot()
+  if not command:
+    result["usageStatusText"] = "Copilot unavailable"
+    result["authHelpText"] = "copilot not found in PATH"
+    return result
+
+  rpc = None
+  try:
+    rpc = CopilotRpc(command, time.monotonic() + rpc_timeout_seconds())
+    try:
+      # Best-effort: the handshake is only required when the server was
+      # started with COPILOT_CONNECTION_TOKEN, and a runtime that tightens
+      # its clientInfo schema must not cost us the quota. A refusal here is
+      # answered and the stream stays usable — verified against 1.0.86,
+      # which rejected a wrong-shaped clientInfo and served the next two
+      # calls anyway.
+      rpc.call("connect", {"clientInfo": {
+        "editorName": "omarchy",
+        "editorVersion": "1",
+        "extensionName": "omarchy-copilot",
+        "extensionVersion": "1",
+      }})
+    except RpcError:
+      pass
+    auth = rpc.call("account.getCurrentAuth") or {}
+    quota = rpc.call("account.getQuota", {}) or {}
+  except Exception as exc:
+    result["usageStatusText"] = "Copilot limits unavailable"
+    result["authHelpText"] = str(exc) or AUTH_HELP
+    # The CLI is installed and we got far enough to try: a failure here is
+    # most likely the network or a runtime still starting, both of which the
+    # panel should retry sooner than the full refresh interval.
+    result["retryAdvised"] = True
+    return result
+  finally:
+    if rpc is not None:
+      rpc.close()
+
+  user = (auth.get("authInfo") or {}).get("copilotUser") or {}
+  if not user.get("login"):
+    # The runtime answered; it said nobody is signed in. Cached quota from a
+    # previous account would be worse than no quota at all.
+    result["_answered"] = True
+    result["usageStatusText"] = "Copilot signed out"
+    result["authHelpText"] = AUTH_HELP
+    return result
+
+  result["_answered"] = True
+
+  result["tierLabel"] = plan_label(user.get("copilot_plan"))
+  result["limits"] = build_limits(quota.get("quotaSnapshots"), user.get("quota_reset_date_utc"))
+  return result
+
+
+def plan_label(plan: Any) -> str:
+  slug = str(plan or "").strip().lower()
+  if not slug:
+    return ""
+  return PLAN_LABELS.get(slug, slug.replace("_", " ").title())
+
+
+def build_limits(snapshots: Any, reset_at: Any) -> list[dict[str, Any]]:
+  """One meter per capped quota bucket.
+
+  `resetsAt` comes from the user payload's quota_reset_date_utc, not from
+  the snapshot's own resetDate — that field carries the moment the snapshot
+  was taken, so a countdown built on it always reads zero.
+  """
+  if not isinstance(snapshots, dict):
+    return []
+  resets_at = str(reset_at or "")
+  limits = []
+  for quota_id, snapshot in sorted(snapshots.items()):
+    if not isinstance(snapshot, dict):
+      continue
+    if snapshot.get("isUnlimitedEntitlement") is True:
+      continue
+    entitlement = snapshot.get("entitlementRequests")
+    try:
+      entitlement = int(entitlement)
+    except (TypeError, ValueError):
+      continue
+    # -1 is the schema's other spelling of unlimited; 0 is a bucket this
+    # plan has no allowance for. Neither is a meter worth drawing.
+    if entitlement <= 0:
+      continue
+    try:
+      remaining = float(snapshot.get("remainingPercentage"))
+    except (TypeError, ValueError):
+      continue
+    # Rounded because 1 - 99.4/100 is 0.005999999999999894 in binary
+    # floating point, and that lands verbatim in a file people read.
+    # Six places still resolves a single request out of a 1500 allowance.
+    percent = round(min(1.0, max(0.0, 1.0 - remaining / 100.0)), 6)
+    label = QUOTA_LABELS.get(str(quota_id), str(quota_id).replace("_", " ").capitalize())
+    limits.append({"label": label, "percent": percent, "resetsAt": resets_at})
+  return limits
+
+
+# ----------------------------------------------------------- cache fallback
+
+
+def read_user_cache() -> dict[str, Any] | None:
+  """The newest entry of the CLI's own disposable user cache.
+
+  Only reached when the RPC will not start. The file is JSONC — it opens
+  with `// Disposable cache ...` lines that json.loads rejects — and the
+  payload hides under a `copilotUserCache` key. It is a snapshot from the
+  last interactive run, so it can be arbitrarily stale.
+  """
+  path = copilot_cache_home() / "copilot-user-cache.json"
+  try:
+    raw = path.read_text(encoding="utf-8")
+  except OSError:
+    return None
+  body = "\n".join(line for line in raw.splitlines() if not line.lstrip().startswith("//"))
+  try:
+    parsed = json.loads(body)
+  except ValueError:
+    return None
+  entries = parsed.get("copilotUserCache") if isinstance(parsed, dict) else None
+  if not isinstance(entries, dict):
+    return None
+  newest = None
+  newest_at = ""
+  for entry in entries.values():
+    if not isinstance(entry, dict):
+      continue
+    retrieved = str(entry.get("retrievedAt") or "")
+    if newest is None or retrieved > newest_at:
+      newest, newest_at = entry, retrieved
+  response = (newest or {}).get("response")
+  return response if isinstance(response, dict) else None
+
+
+def limits_from_user_cache() -> dict[str, Any]:
+  """Translate the cached user payload into the fields fetch_rpc() owns.
+
+  The cached snapshots use the raw API's snake_case shape
+  (percent_remaining / unlimited / entitlement) rather than the RPC's
+  normalized one, so they are mapped onto the same AccountQuotaSnapshot
+  field names before build_limits() sees them.
+  """
+  user = read_user_cache()
+  if not user or not user.get("login"):
+    return {}
+  snapshots = user.get("quota_snapshots")
+  normalized: dict[str, Any] = {}
+  if isinstance(snapshots, dict):
+    for quota_id, snapshot in snapshots.items():
+      if not isinstance(snapshot, dict):
+        continue
+      normalized[quota_id] = {
+        "isUnlimitedEntitlement": snapshot.get("unlimited") is True,
+        "entitlementRequests": snapshot.get("entitlement"),
+        "remainingPercentage": snapshot.get("percent_remaining"),
+      }
+  return {
+    "tierLabel": plan_label(user.get("copilot_plan")),
+    "limits": build_limits(normalized, user.get("quota_reset_date_utc")),
+  }
+
+
+# -------------------------------------------------------------------- main
+
+
+def build_record(max_age: float) -> dict[str, Any]:
+  stats = cached_local_stats(copilot_home() / "session-store.db", max_age)
+  rpc = fetch_rpc()
+
+  if not rpc.pop("_answered", False) and not rpc["limits"]:
+    # The live answer never arrived; the CLI's own cache is the only quota
+    # left. Say so rather than drawing a meter that looks current. An
+    # account whose every quota is genuinely unlimited took the branch above
+    # and keeps its empty limits — a stale cached meter would be a lie.
+    fallback = limits_from_user_cache()
+    if fallback.get("limits"):
+      rpc["limits"] = fallback["limits"]
+      rpc["tierLabel"] = rpc["tierLabel"] or fallback.get("tierLabel", "")
+      rpc["usageStatusText"] = "Quota from cache"
+
+  record: dict[str, Any] = {
+    "schemaVersion": 1,
+    "id": AGENT_ID,
+    "name": AGENT_NAME,
+    "updatedAt": datetime.now(timezone.utc).isoformat(),
+    # Local stats stand on their own: a signed-out or offline machine still
+    # has real tokens and prompts to show, and the status text explains why
+    # the meters are missing.
+    "ready": True,
+    "hasLocalStats": True,
+    # turns gives one row per user message, so unlike Fireworks this record
+    # has genuine prompt counts and the panel can show them.
+    "hasPromptStats": True,
+  }
+  record.update(stats)
+  record.update(rpc)
+  return record
+
+
+def main() -> int:
+  parser = argparse.ArgumentParser(description="Print the Copilot usage record as JSON")
+  # --force rescans and rewrites the cache. --limits-only is the panel's
+  # "I just opened, refresh the numbers that go stale on the wire" call: the
+  # RPC always runs, only the disk scan may be reused.
+  parser.add_argument("--force", action="store_true")
+  parser.add_argument("--limits-only", action="store_true")
+  args = parser.parse_args()
+
+  max_age = 0 if args.force else (LIMITS_ONLY_REUSE_SECONDS if args.limits_only else SCAN_REUSE_SECONDS)
+  try:
+    record = build_record(max_age)
+  except Exception as exc:
+    # A collector that prints nothing takes the tab down with it. Print a
+    # valid record that says what went wrong instead.
+    record = {
+      "schemaVersion": 1,
+      "id": AGENT_ID,
+      "name": AGENT_NAME,
+      "updatedAt": datetime.now(timezone.utc).isoformat(),
+      "ready": False,
+      "hasLocalStats": False,
+      "hasPromptStats": False,
+      "usageStatusText": "Copilot unavailable",
+      "authHelpText": "Copilot usage scan failed",
+      "limits": [],
+      "tierLabel": "",
+      "retryAdvised": False,
+    }
+    record.update(empty_stats())
+    print(f"copilot-usage: {type(exc).__name__}: {exc}", file=sys.stderr)
+  print(json.dumps(record, separators=(",", ":")))
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())

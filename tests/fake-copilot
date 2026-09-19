@@ -1,0 +1,80 @@
+#!/usr/bin/python3
+"""A stand-in for the Copilot CLI's `--stdio` runtime, for the tests.
+
+Speaks the same framing the real one does — vscode-jsonrpc's LSP-style
+Content-Length headers around JSON-RPC 2.0 — so the collector's RPC client is
+exercised for real rather than mocked out. What it answers comes from the
+JSON scenario file named by FAKE_COPILOT_SCENARIO:
+
+    {"connect": {...}, "account.getCurrentAuth": {...}, "account.getQuota": {...}}
+
+A method mapped to {"__error__": "text"} answers with a JSON-RPC error, and a
+method left out answers with a "method not found" error. FAKE_COPILOT_EXIT
+makes the process die on startup instead, standing in for a CLI that cannot
+launch at all, and FAKE_COPILOT_HANG makes it launch and then answer nothing.
+"""
+
+import json
+import os
+import sys
+
+if os.environ.get("FAKE_COPILOT_EXIT"):
+  sys.exit(int(os.environ["FAKE_COPILOT_EXIT"]))
+
+# A runtime that launches cleanly and then never says anything: the case the
+# collector's select-based deadline exists for.
+if os.environ.get("FAKE_COPILOT_HANG"):
+  import time
+  time.sleep(3600)
+
+scenario = {}
+path = os.environ.get("FAKE_COPILOT_SCENARIO")
+if path:
+  with open(path, encoding="utf-8") as handle:
+    scenario = json.load(handle)
+
+
+def read_message():
+  header = b""
+  while not header.endswith(b"\r\n\r\n"):
+    byte = sys.stdin.buffer.read(1)
+    if not byte:
+      return None
+    header += byte
+  length = 0
+  for line in header.decode("ascii", "replace").split("\r\n"):
+    if line.lower().startswith("content-length:"):
+      length = int(line.split(":", 1)[1].strip())
+  body = b""
+  while len(body) < length:
+    chunk = sys.stdin.buffer.read(length - len(body))
+    if not chunk:
+      return None
+    body += chunk
+  return json.loads(body)
+
+
+def write_message(payload):
+  body = json.dumps(payload).encode("utf-8")
+  sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+  sys.stdout.buffer.flush()
+
+
+while True:
+  message = read_message()
+  if message is None:
+    break
+  method = message.get("method")
+  if method == "runtime.shutdown":
+    write_message({"jsonrpc": "2.0", "id": message.get("id"), "result": None})
+    break
+  if method in scenario:
+    answer = scenario[method]
+    if isinstance(answer, dict) and "__error__" in answer:
+      write_message({"jsonrpc": "2.0", "id": message.get("id"),
+                     "error": {"code": -32000, "message": answer["__error__"]}})
+    else:
+      write_message({"jsonrpc": "2.0", "id": message.get("id"), "result": answer})
+  else:
+    write_message({"jsonrpc": "2.0", "id": message.get("id"),
+                   "error": {"code": -32601, "message": f"method not found: {method}"}})

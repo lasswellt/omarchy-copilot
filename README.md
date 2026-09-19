@@ -1,36 +1,146 @@
-# Copilot (Omarchy plugin) — scaffold
+# Copilot — an Omarchy plugin
 
-An [Omarchy](https://omarchy.org) bar widget for the GitHub Copilot CLI,
-modeled on the structure of
-[omarchy-tesla](https://github.com/nixfred/omarchy-tesla).
+GitHub Copilot's premium-request quota, token usage, and rated cost in the
+[Omarchy](https://omarchy.org) bar — and, from the same data, a tab in the
+built-in Agents panel next to Claude and Codex.
 
-**Read [`findings.md`](findings.md) first.** Short version: Copilot's local
-data — `~/.cache/copilot/copilot-user-cache.json` for quota,
-`~/.copilot/session-store.db` for sessions and tokens — fits the built-in
-Agents panel's record contract almost exactly. Confirmed empirically by
-dropping a synthetic record into the panel's usage dir and tracing the
-adoption path in `agents/Main.qml`. The numbers are sitting in plain JSON
-already: no protobuf blobs to decode, no unconfirmed quota RPC.
+## What it shows
 
-Right now `Panel.qml` only shows a placeholder "GH" bar icon. No real data
-collector yet — see `findings.md`, "Next steps".
+- **Premium requests** — the share of the monthly allowance spent, with a
+  countdown to the reset. Read live from the Copilot CLI's own runtime, not
+  from a cache file, so it is current rather than whatever your last
+  interactive session left behind.
+- **AI credits** — Copilot rates every model call in nano-AI-units and calls
+  the result "AI credits" in its own UI. No other agent on this machine
+  reports a cost figure; this is the reason the plugin has a panel of its own
+  rather than only feeding the built-in one.
+- **Tokens by day and by model** — the last week, and the all-time split per
+  model, with the input / output / cache breakdown on hover.
+- **Today** — prompts and sessions, in the hero line.
 
-## Dev loop
+The icon leaves the bar entirely on a machine that has never run Copilot, and
+arrives on its own after the first scan finds usage.
 
-This directory is the source of truth. The installed copy at
-`~/.config/omarchy/plugins/lasswellt.copilot` is a separate git clone
-pulling from this repo's remote,
-<https://github.com/lasswellt/omarchy-copilot>.
+| Key | |
+|---|---|
+| `j` / `k` | scroll |
+| `r` / Enter | refresh now |
+| `o` | open Copilot in a terminal |
+| Tab | neighbouring panel |
+| Esc | close |
 
-```bash
-# after editing here
-cd ~/Projects/omarchy-copilot
-git add -A && git commit -m "..."
-omarchy plugin update lasswellt.copilot --yes
+Right-clicking the bar icon opens Copilot; left-clicking toggles the panel.
+
+## How it works
+
+Two entry points over one data file.
+
 ```
+bin/copilot-usage ──► ~/.local/state/omarchy/agents/usage/copilot.json
+                          │                    ▲
+                          │                    └── Service.qml, on a timer
+                          ├──► the built-in Agents panel (omarchy.agents)
+                          └──► Panel.qml, this plugin's own bar widget
+```
+
+`bin/copilot-usage` prints one JSON record in the same contract the
+first-party `omarchy-agent-usage-*` collectors print. `Service.qml` runs it on
+a timer and publishes the record; the Agents panel adopts any record that
+appears in that directory — the filename is the agent id — and `Panel.qml`
+reads the identical file. There is one data path and two views of it, so the
+two panels can never disagree.
+
+The record comes from two sources:
+
+| | |
+|---|---|
+| Quota, plan, sign-in | The CLI's own JSON-RPC runtime (`copilot --headless --stdio`), via `account.getQuota` and `account.getCurrentAuth`. Account-wide, and about 1.4 s per call. Spends no premium requests. |
+| Tokens, prompts, sessions | `~/.copilot/session-store.db`, read-only. Machine-local. |
+
+If the runtime will not start, the collector falls back to the disposable
+cache the CLI keeps for itself and labels the meter "Quota from cache" — it
+can be arbitrarily stale, and saying so beats drawing a meter that looks
+current. Local stats are unaffected either way: they are real whether or not
+GitHub is reachable.
+
+`~/.copilot` and `~/.cache/copilot` are honored through the CLI's own
+`COPILOT_HOME` and `COPILOT_CACHE_HOME` overrides.
+
+See [`roadmap.md`](roadmap.md) for how all of this was derived — including the
+three traps that a naive reading of Copilot's data falls into — and
+[`findings.md`](findings.md) for where Copilot keeps things on disk.
+
+## Settings
+
+One, in the bar widget's settings (`omarchy` menu → Bar → Copilot):
+
+| Setting | Default | |
+|---|---|---|
+| `refreshIntervalSec` | 900 | How often to re-read the quota and rescan local sessions. Floored at 60. |
+
+The service reads the same value out of the bar layout, so the schedule is
+one setting whether or not the widget is in the bar.
 
 ## Install
 
 ```bash
-omarchy plugin add ~/Projects/omarchy-copilot --enable
+omarchy plugin add https://github.com/lasswellt/omarchy-copilot.git --enable
 ```
+
+Both surfaces come from that one install. To use only the Agents-panel tab,
+remove the Copilot widget from the bar and leave the plugin enabled — the
+service keeps publishing.
+
+## Commands
+
+```bash
+copilot-usage                    # print the record, change nothing
+copilot-usage-update             # publish it to the Agents usage directory
+copilot-usage-update --force     # ignore the scan cache
+copilot-usage-update --stdout    # print what it would publish
+
+omarchy-shell lasswellt.copilot toggle        # the panel
+omarchy-shell lasswellt.copilot.data refresh  # publish now, panel closed
+```
+
+## Tests
+
+```bash
+./tests/run      # contract tests: 1131 checks, no network, no real home dir
+./tests/lint     # manifest, shell, python, qmllint
+```
+
+`tests/run` builds a throwaway `COPILOT_HOME` and puts `tests/fake-copilot` —
+a stand-in that speaks the real JSON-RPC framing — ahead of the CLI on PATH,
+so the RPC client is exercised rather than mocked. It also asserts, against
+the real database when there is one, the identity the token mapping rests on:
+that `input_tokens` is the inclusive total and `token_details_json` holds the
+disjoint parts. If Copilot ever changes that, the tests say so.
+
+## Dev loop
+
+This directory is the source of truth. The installed copy at
+`~/.config/omarchy/plugins/lasswellt.copilot` is a git clone whose `origin` is
+this directory, so a local commit is enough — nothing needs pushing to test.
+
+```bash
+cd ~/Projects/omarchy-copilot
+./tests/run && ./tests/lint
+git add -A && git commit -m "..."
+omarchy plugin update lasswellt.copilot --yes
+```
+
+## Known limits
+
+- **No mark in the Agents panel.** That panel resolves an agent's logo as
+  `assets/<id>.svg` relative to its own directory, which is root-owned under
+  `/usr/share/omarchy`. A third-party plugin cannot install one there, so the
+  Copilot tab falls back to the bar glyph. This plugin's own panel has its
+  own icon and is unaffected.
+- **Premium-request counts are account-wide.** They include what the IDE, the
+  web, and your other machines spent. Tokens and prompts are this machine
+  only. That split is inherent to where each number comes from.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).

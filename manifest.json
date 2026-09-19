@@ -2,24 +2,41 @@
   "schemaVersion": 1,
   "id": "lasswellt.copilot",
   "name": "Copilot",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Tom Lasswell",
-  "description": "GitHub Copilot CLI status in the Omarchy bar. Stub: no real data wired up yet.",
-  "homepage": "https://github.com/lasswellt/omarchy-copilot",
   "license": "MIT",
+  "description": "GitHub Copilot premium-request quota, tokens, and AI credits in the Omarchy bar — and in the built-in Agents panel.",
+  "homepage": "https://github.com/lasswellt/omarchy-copilot",
   "kinds": [
-    "bar-widget"
+    "bar-widget",
+    "service"
   ],
+  "keepLoaded": true,
   "entryPoints": {
-    "barWidget": "Panel.qml"
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
   },
   "barWidget": {
     "displayName": "Copilot",
-    "description": "GitHub Copilot CLI status in the Omarchy bar. Stub: no real data wired up yet.",
+    "description": "Premium-request quota with a reset countdown, tokens by day and by model, and the AI credits Copilot rates each call in.",
     "category": "AI",
+    "aliases": ["copilot", "gh-copilot"],
     "allowMultiple": false,
     "defaultSection": "right",
-    "defaults": {},
-    "schema": []
+    "defaults": {
+      "refreshIntervalSec": 900
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 60,
+        "max": 3600,
+        "step": 30,
+        "defaultValue": 900,
+        "description": "How often to re-read the quota and rescan local sessions. Each run briefly starts the Copilot runtime; it spends no premium requests."
+      }
+    ]
   }
 }

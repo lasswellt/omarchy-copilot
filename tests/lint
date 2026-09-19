@@ -1,0 +1,94 @@
+#!/bin/bash
+
+# Static checks that need no running shell: the manifest against the schema
+# the shell enforces, and the QML against qmllint.
+#
+# Three warning categories are switched off because the Omarchy plugin idiom
+# produces them by construction, in first-party code as much as here:
+#
+#   unqualified       nested Components reach out to the root's id, which is
+#                     how every first-party panel is written
+#   missing-property  `bar` is injected at runtime and typed QObject, so
+#                     qmllint cannot see bar.foreground / bar.run
+#   unused-imports    qs.Commons supplies Color and Style as singletons
+#
+# Everything else — syntax, unknown types, bad signal handlers — still fails
+# the run. For calibration: /usr/share/omarchy/shell/plugins/agents/Panel.qml
+# produces exactly these three categories and nothing else.
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+QMLLINT="${QMLLINT:-/usr/lib/qt6/bin/qmllint}"
+status=0
+
+echo "manifest"
+if command -v omarchy-plugin-validate >/dev/null 2>&1; then
+  if omarchy-plugin-validate "$ROOT"; then
+    echo "  ok"
+  else
+    echo "  FAILED"
+    status=1
+  fi
+else
+  echo "  skipped (omarchy-plugin-validate not on PATH)"
+fi
+
+echo "shell scripts"
+for script in "$ROOT"/bin/copilot-usage-update "$ROOT"/tests/lint; do
+  if bash -n "$script"; then
+    echo "  ok $(basename "$script")"
+  else
+    echo "  FAILED $(basename "$script")"
+    status=1
+  fi
+done
+
+echo "python"
+for script in "$ROOT"/bin/copilot-usage "$ROOT"/tests/run "$ROOT"/tests/fixtures.py "$ROOT"/tests/fake-copilot; do
+  if python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$script"; then
+    echo "  ok $(basename "$script")"
+  else
+    echo "  FAILED $(basename "$script")"
+    status=1
+  fi
+done
+
+echo "qml"
+if [[ ! -x $QMLLINT ]]; then
+  echo "  skipped (qmllint not found at $QMLLINT; set QMLLINT=)"
+else
+  # The shell's modules are named qs.Ui and qs.Commons, so qmllint needs an
+  # import root with a `qs` directory in it. Built in a temp dir rather than
+  # the plugin folder: omarchy-plugin-validate refuses symlinks inside a
+  # plugin, and this one would be a symlink.
+  importroot=$(mktemp -d) || exit 1
+  trap 'rm -rf "$importroot"' EXIT
+  shelldir="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
+  if [[ -d $shelldir/Ui ]]; then
+    mkdir -p "$importroot/qs"
+    ln -s "$shelldir/Ui" "$importroot/qs/Ui"
+    ln -s "$shelldir/Commons" "$importroot/qs/Commons"
+  else
+    echo "  note: $shelldir not found; linting without the shell's modules"
+  fi
+
+  output=$("$QMLLINT" -I "$importroot" \
+    --unqualified disable --missing-property disable --unused-imports disable \
+    "$ROOT"/Panel.qml "$ROOT"/Service.qml 2>&1)
+  if [[ -n $output ]]; then
+    echo "  FAILED"
+    echo "$output" | sed 's/^/    /'
+    status=1
+  else
+    echo "  ok Panel.qml Service.qml"
+  fi
+fi
+
+echo
+if (( status == 0 )); then
+  echo "lint ok"
+else
+  echo "lint FAILED"
+fi
+exit $status
