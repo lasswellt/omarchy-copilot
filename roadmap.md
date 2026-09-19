@@ -484,9 +484,13 @@ panel reads — so the two views cannot disagree. Opening it asks for
    built-in Agents panel here.**
 5. [x] Manifest, then `Panel.qml` over the same record.
 6. [x] Docs. Assets and distribution still open (§8).
-7. [x] AI credits. Local premium-request counts and per-repo activity remain
-   available and unbuilt — `Σ request_multiplier` and the `sessions` table's
-   `repository` / `branch` columns respectively.
+7. [x] AI credits, local premium-request counts, and per-repo activity — all
+   three built. `sessions.repository` was verified rather than assumed by
+   running the CLI inside a git repository: it holds `"lasswellt/
+   omarchy-copilot"`, with `host_type` `github` and `branch` `master`, which
+   matches the session-events schema's "repository identifier derived from
+   the git remote URL". The same run created a housekeeping session with no
+   turns, which the rollup correctly leaves out.
 
 ### Installing over a running shell
 

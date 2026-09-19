@@ -10,10 +10,15 @@ built-in Agents panel next to Claude and Codex.
   countdown to the reset. Read live from the Copilot CLI's own runtime, not
   from a cache file, so it is current rather than whatever your last
   interactive session left behind.
-- **AI credits** — Copilot rates every model call in nano-AI-units and calls
-  the result "AI credits" in its own UI. No other agent on this machine
-  reports a cost figure; this is the reason the plugin has a panel of its own
-  rather than only feeding the built-in one.
+- **This machine** — that meter is account-wide: it counts the IDE, the web,
+  and every other machine you use. Underneath it, the premium requests and
+  AI credits that were spent *here*. Copilot rates every call in
+  nano-AI-units and calls the result "AI credits" in its own UI; no other
+  agent on this machine reports a cost figure at all.
+- **Workspaces** — where the work happened, newest first: the repository
+  (`owner/name`, from the git remote), how long ago, and the branch, sessions
+  and prompts on hover. Sessions started outside a repository show their
+  directory.
 - **Tokens by day and by model** — the last week, and the all-time split per
   model, with the input / output / cache breakdown on hover.
 - **Today** — prompts and sessions, in the hero line.
@@ -55,7 +60,7 @@ The record comes from two sources:
 | | |
 |---|---|
 | Quota, plan, sign-in | The CLI's own JSON-RPC runtime (`copilot --headless --stdio`), via `account.getQuota` and `account.getCurrentAuth`. Account-wide, and about 1.4 s per call. Spends no premium requests. |
-| Tokens, prompts, sessions | `~/.copilot/session-store.db`, read-only. Machine-local. |
+| Tokens, prompts, sessions, premium requests, workspaces | `~/.copilot/session-store.db`, read-only. Machine-local. |
 
 If the runtime will not start, the collector falls back to the disposable
 cache the CLI keeps for itself and labels the meter "Quota from cache" — it
@@ -108,14 +113,14 @@ omarchy-shell lasswellt.copilot.data refresh  # publish now, panel closed
 blocks — cheap enough for a prompt segment or a polling script:
 
 ```console
-$ omarchy-shell lasswellt.copilot status | jq -r '"\(.percentUsed)% of \(.limit)"'
-1% of Premium requests
+$ omarchy-shell lasswellt.copilot status | jq -r '"\(.percentUsed)% used · \(.premiumTotal) from here"'
+1% used · 4 from here
 ```
 
 ## Tests
 
 ```bash
-./tests/run      # contract tests: 1199 checks, no network, no real home dir
+./tests/run      # contract tests: 1480 checks, no network, no real home dir
 ./tests/lint     # manifest, shell, python, qmllint
 ```
 
@@ -170,9 +175,10 @@ omarchy-shell lasswellt.copilot.data refresh  # "Target not found."   = service 
   `/usr/share/omarchy`. A third-party plugin cannot install one there, so the
   Copilot tab falls back to the bar glyph. This plugin's own panel has its
   own icon and is unaffected.
-- **Premium-request counts are account-wide.** They include what the IDE, the
-  web, and your other machines spent. Tokens and prompts are this machine
-  only. That split is inherent to where each number comes from.
+- **The quota meter is account-wide.** It includes what the IDE, the web, and
+  your other machines spent, because that is what GitHub bills. Everything
+  under "this machine" is local, and the two will not match. That split is
+  inherent to where each number comes from, and showing both is the point.
 
 ## License
 

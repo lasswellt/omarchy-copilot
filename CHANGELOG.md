@@ -24,7 +24,14 @@ carried no data.
   nothing to report.
 - AI credits in the record (`aiCredits`), rated from `total_nano_aiu`. Beyond
   the contract and ignored by the built-in panel; shown in ours.
-- `tests/run` (1199 checks) and `tests/lint`. The tests speak the real
+- `premiumRequests` — what this machine spent of the account-wide allowance,
+  summing `request_multiplier` over user-initiated calls. Cross-checked
+  against the CLI's own per-session `totalPremiumRequests`.
+- `workspaces` — sessions grouped by `sessions.repository` (`owner/name`,
+  from the git remote), newest first, with branch, sessions, prompts and
+  tokens. Sessions outside a repository group by full working directory and
+  display its basename; housekeeping sessions are excluded.
+- `tests/run` (1480 checks) and `tests/lint`. The tests speak the real
   JSON-RPC framing through `tests/fake-copilot` rather than mocking the
   client, and assert the token identity the mapping rests on against the real
   database when one is present.
