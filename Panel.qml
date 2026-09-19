@@ -286,6 +286,23 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): string { root.refreshNow(true); return "ok" }
+
+    // The headline numbers, for scripting — a status bar of your own, a
+    // prompt segment, a notification when the allowance runs low. Reads the
+    // record already in memory, so it costs nothing and never blocks.
+    function status(): string {
+      return JSON.stringify({
+        tier: String(root.value("tierLabel", "")),
+        limit: root.headline ? String(root.headline.label) : "",
+        percentUsed: root.headline ? Math.round(Number(root.headline.percent) * 100) : -1,
+        resetsAt: root.headline ? String(root.headline.resetsAt || "") : "",
+        todayPrompts: root.numberValue(root.value("todayPrompts", 0)),
+        todayTokens: root.numberValue(root.value("todayTotalTokens", 0)),
+        creditsToday: root.credits ? Number(root.credits.today) : 0,
+        status: root.statusText,
+        updatedAt: String(root.value("updatedAt", ""))
+      })
+    }
   }
 
   BarIconButton {
