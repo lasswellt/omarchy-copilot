@@ -99,7 +99,7 @@ def build_home(root: Path, sessions=(), turns=(), events=(), with_db: bool = Tru
   return root
 
 
-def build_cache(root: Path, login: str = "lasswellt", plan: str = "individual",
+def build_cache(root: Path, login: str = "octocat", plan: str = "individual",
                 entitlement: int = 1500, percent_remaining: float = 80.0,
                 reset: str = "2026-10-01T00:00:00.000Z",
                 retrieved: str = "2026-09-18T19:33:40.657Z",
@@ -142,7 +142,7 @@ def build_cache(root: Path, login: str = "lasswellt", plan: str = "individual",
   return root
 
 
-def rpc_scenario(path: Path, login: str = "lasswellt", plan: str = "individual",
+def rpc_scenario(path: Path, login: str = "octocat", plan: str = "individual",
                  reset: str = "2026-10-01T00:00:00.000Z",
                  snapshots: dict | None = None, auth_error: str | None = None,
                  quota_error: str | None = None, signed_out: bool = False) -> Path:
