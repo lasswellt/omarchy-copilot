@@ -1,5 +1,12 @@
 # Findings
 
+> **Superseded in part by [`roadmap.md`](roadmap.md) (2026-09-18).** The
+> quota and sign-in sections below aim at `copilot-user-cache.json`; the CLI
+> ships a JSON-RPC server with an `account.getQuota` method that answers both
+> live, and the cache file was measurably stale when the two were compared.
+> The token mapping below also double-counts. `roadmap.md` §"What changed"
+> has the table. Everything about *where files live* is still accurate.
+
 Research notes, written before any real widget logic. Read this first in a
 fresh session. Same exercise as
 [`omarchy-antigravity`](../omarchy-antigravity) ran for Antigravity — read
@@ -89,7 +96,16 @@ directory either way (see below) — they share it.
 
 ## Quota data (`~/.cache/copilot/copilot-user-cache.json`)
 
-Plain JSON, keyed by a cache key, each entry a full snapshot of GitHub's
+**Corrected (roadmap.md §2): this is the fallback source, not the primary
+one, and it is not plain JSON.** The file opens with two `//` comment lines,
+and the payload sits under a `copilotUserCache` key that the excerpt below
+omits — `json.loads` on the raw bytes fails. It is also stale between CLI
+runs: it read `quota_remaining: 1500` / `percent_remaining: 100` at a moment
+when the live RPC reported 5 premium requests used. Use
+`account.getQuota` (roadmap.md §2); keep this file for when the RPC will not
+start.
+
+Keyed by a cache key, each entry a full snapshot of GitHub's
 Copilot user/quota API response. Real example (values current as of this
 research):
 
@@ -127,11 +143,12 @@ The file holds multiple timestamped entries (cache keys change per some
 input, maybe workspace or auth scope) — take the one with the newest
 `retrievedAt`.
 
-**Open question:** haven't confirmed how often this cache refreshes on its
-own (is it only updated when the CLI runs a request, or does it poll?) or
-whether there's a `copilot` subcommand that forces a refresh without
-spending a request. Worth checking `copilot --help` output further and/or
-strace-ing one invocation.
+**Answered (roadmap.md §2).** It refreshes when the CLI runs, and not
+otherwise — a passive reader gets whatever the last interactive session left
+behind. There is no subcommand that forces a refresh, but there is something
+better: `copilot --headless --no-auto-update --stdio` starts a JSON-RPC
+server whose `account.getQuota` returns live numbers in ~1.4 s end to end,
+with no session created and no premium request spent.
 
 ## Session/token data (`~/.copilot/session-store.db`)
 
@@ -162,14 +179,20 @@ CREATE TABLE assistant_usage_events (
 `session_files`, `session_refs` — not investigated, not obviously
 usage-relevant.)
 
-`assistant_usage_events` is the direct equivalent of Claude's per-model
-token buckets: `input_tokens`/`output_tokens`/`cache_read_tokens`/
-`cache_write_tokens` map one-to-one onto the record contract's `modelUsage`
-shape (`inputTokens`/`outputTokens`/`cacheCreationInputTokens`/
-`cacheReadInputTokens` — note `cache_write_tokens` ↔
-`cacheCreationInputTokens`, `cache_read_tokens` ↔ `cacheReadInputTokens`).
-One row per model call, joinable to `sessions` for per-day/per-session
-rollups via `created_at`.
+`assistant_usage_events` is the equivalent of Claude's per-model token
+buckets, one row per model call, joinable to `sessions` for per-day and
+per-session rollups via `created_at`.
+
+**Corrected (roadmap.md §4): the mapping is not one-to-one, and the naive
+version double-counts.** `input_tokens` is the *total* prompt size with cache
+included — the live row has `input_tokens: 15805` against a
+`token_details_json` breakdown of 3 uncached input + 15802 cache_write.
+`inputTokens` must come from `token_details_json`, or from
+`max(0, input_tokens - cache_read_tokens - cache_write_tokens)`.
+`cache_write_tokens` ↔ `cacheCreationInputTokens` and `cache_read_tokens` ↔
+`cacheReadInputTokens` do hold. Two further traps: the database is WAL (open
+it `mode=ro` + `query_only`), and `created_at` is UTC, so bucketing with
+SQLite's `date()` files evening work under the wrong day.
 
 `total_nano_aiu` and `token_details_json` (a per-token-type cost breakdown,
 `costPerBatch` in some internal billing unit) look like real cost/billing
@@ -178,6 +201,11 @@ back a cost estimate later the way the built-in Fireworks collector
 estimates spend.
 
 ## Sign-in detection
+
+**Superseded (roadmap.md §3):** `account.getCurrentAuth` returns the live
+credential source, login, and the whole user payload in one call. The
+reasoning below is still right about the file being unambiguous; it is just
+no longer the best available answer.
 
 Unlike Antigravity (where `~/.gemini/google_accounts.json` turned out to
 belong to a *different* product's login — see
@@ -216,14 +244,22 @@ drift between the two copies.
 
 ## Next steps
 
-1. Confirm the copilot tab actually *renders* in the Agents panel (see
-   "Confirmed empirically" above — the render path itself wasn't visually
-   checked, only the discovery/adoption path).
-2. Write `bin/copilot-usage`: read `copilot-user-cache.json` (newest
-   `retrievedAt` entry) for quota/sign-in, `session-store.db` for
-   sessions/turns/`assistant_usage_events` for token rollups, emit the §2
-   record contract from `omarchy-antigravity/roadmap.md`.
-3. Add fixtures (fake `copilot-user-cache.json` + fake `session-store.db`)
-   and a smoke test, same shape as `omarchy-antigravity/tests/`.
+Superseded by [`roadmap.md`](roadmap.md) §9, which is built on live probes
+rather than the plan below. Item 1 here is still outstanding and still
+cosmetic.
+
+1. ~~Confirm the copilot tab actually *renders* in the Agents panel.~~
+   **Done** — see `roadmap.md` §9, "The render question, answered". The
+   missing piece was `omarchy-shell omarchy.agents next`, an IPC method that
+   advances the selected provider; driving it until Copilot was selected made
+   `heroMarkImage` evaluate and log the expected `Cannot open
+   .../assets/copilot.svg`.
+2. ~~Write `bin/copilot-usage` against the cache file and the database.~~
+   Rewritten as roadmap.md §8, "Collector": RPC first, database second.
+3. Add fixtures and a smoke test — now possible without touching the real
+   home directory, via the `COPILOT_HOME` and `COPILOT_CACHE_HOME` overrides
+   (roadmap.md §5).
 4. Ship the collector as Route C: drop the record into the Agents usage dir
-   *and* feed this repo's own `Panel.qml`.
+   *and* feed this repo's own `Panel.qml`. The schedule is a `service`-kind
+   entry point; `omarchy-agent-usage-update` will never run a third-party
+   collector, and never deletes a record it didn't write.
