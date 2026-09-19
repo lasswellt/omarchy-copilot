@@ -442,8 +442,13 @@ panel reads — so the two views cannot disagree. Opening it asks for
       Font GitHub glyph that needs no vendoring and raises no trademark
       question. Reopen it only if the panel grows a surface a glyph cannot
       serve
-- [ ] `preview.png` for the README. Cosmetic; the README no longer references
-      one, so it is an addition rather than a hole
+- [x] `preview.png` for the README. Captured by diffing a `grim` shot of the
+      screen with the panel open against one with it closed — the popup lives
+      inside a full-screen `omarchy-keyboard-panel` layer, so `hyprctl layers`
+      gives no bounds to crop to. Note `grim` captures physical pixels
+      (3200x2000 here), not the 2560x1600 logical space `hyprctl monitors`
+      reports, which is a 1.25x error waiting to happen. Cropped to the
+      panel's own border so no other window's contents ship with it
 
 ### Tests
 - [x] Record-contract assertion over collector output, in every case

@@ -4,6 +4,8 @@ GitHub Copilot's premium-request quota, token usage, and rated cost in the
 [Omarchy](https://omarchy.org) bar — and, from the same data, a tab in the
 built-in Agents panel next to Claude and Codex.
 
+<img src="preview.png" alt="The Copilot panel: quota meter, this-machine figures, workspaces, and tokens by day" width="380">
+
 ## What it shows
 
 - **Premium requests** — the share of the monthly allowance spent, with a
