@@ -237,7 +237,13 @@ directory, harmless, but it means the collector is not strictly read-only at
 the filesystem level. On a read-only `~/.copilot` it would fail; copy to a
 temp file if that ever matters.
 
-**Dates are UTC.** `created_at` is written as ISO-8601 with a `Z`
+**Dates are UTC — confirmed in the wild.** While this was being built the
+clock crossed UTC midnight: at `2026-09-19T01:56Z`, local time was
+`2026-09-18 21:56 EDT`, and the published record correctly reported today as
+`2026-09-18` with 2 prompts and 31,629 tokens. A naive `date('now')` would
+have reported the 19th, with nothing on it. The detail below is why.
+
+`created_at` is written as ISO-8601 with a `Z`
 (`2026-09-18T20:14:42.409Z`) even though the column default is
 `datetime('now')`. SQLite's `date()` parses both, but returns UTC — and
 `date('now')` is UTC too, so a naive `WHERE date(created_at) = date('now')`
@@ -445,6 +451,20 @@ panel reads — so the two views cannot disagree. Opening it asks for
 7. [x] AI credits. Local premium-request counts and per-repo activity remain
    available and unbuilt — `Σ request_multiplier` and the `sessions` table's
    `repository` / `branch` columns respectively.
+
+### Installing over a running shell
+
+`omarchy plugin update` pulls the files and the registry re-reads the
+manifest — `omarchy-plugin-list --json` shows the new `kinds` at once — but
+already-loaded QML is not reloaded, and `omarchy-shell shell rescanPlugins`
+does not change that. The bar kept running the 0.1.0 stub and never started
+the newly declared service until `omarchy restart shell`.
+
+The symptom is indistinguishable from a broken plugin, so test with a method
+only the new code has rather than one both versions share: `lasswellt.copilot
+toggle` answered fine from the *old* stub, while `lasswellt.copilot refresh`
+returned "Function not found." and `lasswellt.copilot.data refresh` returned
+"Target not found." — which is what a stale load looks like.
 
 ### The render question, answered
 

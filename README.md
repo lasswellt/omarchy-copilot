@@ -128,7 +128,22 @@ cd ~/Projects/omarchy-copilot
 ./tests/run && ./tests/lint
 git add -A && git commit -m "..."
 omarchy plugin update lasswellt.copilot --yes
+omarchy restart shell
 ```
+
+That last line is not optional. `omarchy plugin update` pulls the files and
+the shell re-reads the manifest — `omarchy plugin list` will show the new
+`kinds` immediately — but QML that is already loaded stays loaded. Without a
+restart the bar keeps running the previous `Panel.qml` and never starts a
+newly declared service, which looks exactly like a plugin that does not work.
+Check with a method only the new code has:
+
+```bash
+omarchy-shell lasswellt.copilot refresh       # "Function not found." = still the old QML
+omarchy-shell lasswellt.copilot.data refresh  # "Target not found."   = service not loaded
+```
+
+`omarchy restart shell` refuses while the session is locked, by design.
 
 ## Known limits
 
