@@ -169,8 +169,12 @@ def main() -> int:
         ("s2", model_a, 2200, 100, 2000, 100, 0,
          fixtures.token_details(model_a, 100, 2000, 100, 100),
          fixtures.utc_stamp(noon_today), 1_000_000_000),
+        # reasoning_tokens is set, and output_tokens already contains it:
+        # 50 output of which 20 were reasoning, exactly as Copilot reports a
+        # --reasoning-effort high call. There is no `reasoning` entry in the
+        # details, because Copilot does not write one.
         ("s2", model_b, 500, 50, 0, 0, 20,
-         fixtures.token_details(model_b, 500, 0, 0, 50, reasoning=20),
+         fixtures.token_details(model_b, 500, 0, 0, 50),
          fixtures.utc_stamp(noon_today), 500_000_000),
       ])
     scenario = fixtures.rpc_scenario(tmp / "happy.json")
@@ -207,8 +211,8 @@ def main() -> int:
     check("happy/cacheReadInputTokens", bucket_a["cacheReadInputTokens"] == 2000,
           str(bucket_a["cacheReadInputTokens"]))
     bucket_b = record["modelUsage"][model_b]
-    check("happy/reasoning lands in outputTokens", bucket_b["outputTokens"] == 70,
-          f"{bucket_b['outputTokens']} (50 output + 20 reasoning)")
+    check("happy/reasoning is not added to output", bucket_b["outputTokens"] == 50,
+          f"{bucket_b['outputTokens']} — output already contains the 20 reasoning tokens")
 
     today_total = sum(record["todayTokensByModel"].values())
     check("happy/aiCredits rated from nano units",
@@ -221,6 +225,27 @@ def main() -> int:
           f"{recent.get(today)} vs {record['todayTotalTokens']}")
     check("happy/recentDays carries yesterday", recent.get(yesterday) == 15811,
           str(recent.get(yesterday)))
+
+    # -------------------------------- a token type the collector has not seen
+    #
+    # Copilot reports four types today. A fifth appearing server-side must be
+    # ignored, not guessed into a bucket: the four the contract asks for are
+    # named, and anything else is somebody else's accounting.
+    home = fixtures.build_home(
+      tmp / "extratype",
+      sessions=[("s1", "x", fixtures.utc_stamp(noon_today), fixtures.utc_stamp(noon_today))],
+      turns=[("s1", 0, "hi", fixtures.utc_stamp(noon_today))],
+      events=[("s1", model_a, 100, 10, 0, 0, 0,
+               fixtures.token_details(model_a, 100, 0, 0, 10, extra_type="audio",
+                                      extra_count=999),
+               fixtures.utc_stamp(noon_today))])
+    record = run(home, scenario=scenario)
+    check_contract("extratype", record)
+    bucket = record["modelUsage"][model_a]
+    check("extratype/unknown type ignored",
+          bucket == {"inputTokens": 100, "outputTokens": 10,
+                     "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0},
+          json.dumps(bucket))
 
     # ------------------------------------------- flat columns, no details
     home = fixtures.build_home(
@@ -450,19 +475,30 @@ def main() -> int:
       conn = sqlite3.connect(real_db.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
       try:
         rows = conn.execute(
-          "SELECT id, input_tokens, token_details_json FROM assistant_usage_events"
+          "SELECT id, input_tokens, output_tokens, reasoning_tokens,"
+          " token_details_json FROM assistant_usage_events"
           " WHERE token_details_json IS NOT NULL").fetchall()
       finally:
         conn.close()
       checked = 0
-      for row_id, inclusive, raw in rows:
+      for row_id, inclusive, out, reasoning, raw in rows:
         try:
           parts = {e["tokenType"]: e["tokenCount"] for e in json.loads(raw)}
         except Exception:
           continue
         total = parts.get("input", 0) + parts.get("cache_read", 0) + parts.get("cache_write", 0)
-        check(f"identity/row {row_id}", int(inclusive or 0) == total,
+        check(f"identity/row {row_id} input", int(inclusive or 0) == total,
               f"input_tokens={inclusive} but details sum to {total}")
+        # The other half of the model: output_tokens is the details' output
+        # entry, reasoning already inside it, and there is no separate
+        # reasoning entry to add. Measured on a --reasoning-effort high run.
+        check(f"identity/row {row_id} output", int(out or 0) == parts.get("output", 0),
+              f"output_tokens={out} but details say {parts.get('output', 0)}")
+        check(f"identity/row {row_id} no reasoning entry", "reasoning" not in parts,
+              f"details gained a reasoning type: {sorted(parts)}")
+        check(f"identity/row {row_id} reasoning fits inside output",
+              int(reasoning or 0) <= int(out or 0),
+              f"reasoning_tokens={reasoning} exceeds output_tokens={out}")
         checked += 1
       print(f"  (identity checked against {checked} real rows)")
     else:

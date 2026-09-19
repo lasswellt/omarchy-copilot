@@ -115,7 +115,7 @@ $ omarchy-shell lasswellt.copilot status | jq -r '"\(.percentUsed)% of \(.limit)
 ## Tests
 
 ```bash
-./tests/run      # contract tests: 1131 checks, no network, no real home dir
+./tests/run      # contract tests: 1199 checks, no network, no real home dir
 ./tests/lint     # manifest, shell, python, qmllint
 ```
 
@@ -123,8 +123,10 @@ $ omarchy-shell lasswellt.copilot status | jq -r '"\(.percentUsed)% of \(.limit)
 a stand-in that speaks the real JSON-RPC framing — ahead of the CLI on PATH,
 so the RPC client is exercised rather than mocked. It also asserts, against
 the real database when there is one, the identity the token mapping rests on:
-that `input_tokens` is the inclusive total and `token_details_json` holds the
-disjoint parts. If Copilot ever changes that, the tests say so.
+that `input_tokens` is the inclusive total, that `output_tokens` matches the
+details' output entry with reasoning tokens already inside it, and that no
+`reasoning` token type exists to be added. If Copilot ever changes that, the
+tests say so.
 
 ## Dev loop
 

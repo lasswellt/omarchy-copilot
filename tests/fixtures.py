@@ -59,16 +59,25 @@ def utc_stamp(local: datetime) -> str:
 
 
 def token_details(model: str, inp: int, cache_read: int, cache_write: int,
-                  output: int, reasoning: int | None = None) -> str:
+                  output: int, extra_type: str | None = None,
+                  extra_count: int = 0) -> str:
+  """The four token types Copilot actually reports, in its own shape.
+
+  There is deliberately no `reasoning` entry: a `--reasoning-effort high` run
+  that burned 13 reasoning tokens still reported one `output` entry of 17,
+  matching `output_tokens`, with reasoning already inside it. extra_type is
+  for asserting that a type the collector has never seen is ignored rather
+  than folded into a bucket it does not belong in.
+  """
   entries = [
     {"batchSize": 1000000, "costPerBatch": 200000000000, "tokenCount": inp, "tokenType": "input", "model": model},
     {"batchSize": 1000000, "costPerBatch": 20000000000, "tokenCount": cache_read, "tokenType": "cache_read", "model": model},
     {"batchSize": 1000000, "costPerBatch": 250000000000, "tokenCount": cache_write, "tokenType": "cache_write", "model": model},
     {"batchSize": 1000000, "costPerBatch": 1200000000000, "tokenCount": output, "tokenType": "output", "model": model},
   ]
-  if reasoning is not None:
+  if extra_type is not None:
     entries.append({"batchSize": 1000000, "costPerBatch": 1200000000000,
-                    "tokenCount": reasoning, "tokenType": "reasoning", "model": model})
+                    "tokenCount": extra_count, "tokenType": extra_type, "model": model})
   return json.dumps(entries)
 
 

@@ -9,8 +9,9 @@ the collector at the wrong data source.
 in §8 is checked off bar three notes: a `preview.png`, a test for a database
 locked mid-write, and the SVG mark, which is closed rather than pending
 because nothing can consume it. The Agents-panel tab was confirmed rendering
-on this machine (see §9). One correctness question is still open — §4, on
-whether `output_tokens` already includes `reasoning_tokens`. What follows is kept as the derivation —
+on this machine (see §9), and §4's last correctness question — whether
+`output_tokens` already includes `reasoning_tokens` — has been measured and
+answered: it does. What follows is kept as the derivation —
 why each field is read the way it is — not as a plan.
 
 The headline: **Copilot ships its own JSON-RPC server, its own JSON Schema
@@ -193,11 +194,39 @@ check is no longer a suggestion — `tests/run` asserts
 over every row of the real database on every run, so a change in Copilot's
 reporting surfaces as a test failure rather than as quietly wrong numbers.
 
-**Open, same reason:** whether `output_tokens` already includes
-`reasoning_tokens`. `reasoning_tokens` was 0 here so the row cannot tell.
-The opencode path in the Codex collector adds reasoning to output explicitly
-("opencode keeps thinking tokens out of output"), so the same question has
-gone both ways before. Settle it with one `--reasoning-effort high` run.
+**Answered — `output_tokens` already includes `reasoning_tokens`.** Settled
+with the `--reasoning-effort high` run this called for:
+
+```jsonc
+// copilot -p "What is 4271 times 3? ..." --reasoning-effort high
+{"model":"claude-sonnet-5","input_tokens":21489,"output_tokens":17,
+ "cache_read_tokens":0,"cache_write_tokens":21487,"reasoning_tokens":13,
+ "total_nano_aiu":5389150000,"reasoning_effort":"high"}
+
+// token_details_json — note what is NOT in it
+[{"tokenType":"input","tokenCount":2},{"tokenType":"cache_read","tokenCount":0},
+ {"tokenType":"cache_write","tokenCount":21487},{"tokenType":"output","tokenCount":17}]
+```
+
+Three independent agreements: `output_tokens` is 17 while `reasoning_tokens`
+is 13, so reasoning is a subset rather than a sibling; the details carry an
+`output` entry of 17 and **no `reasoning` entry at all**; and the CLI's own
+footer printed `↓ 17 (13 reasoning)`, parenthesising it as a component.
+
+The Codex collector's opencode path adds reasoning to output explicitly
+("opencode keeps thinking tokens out of output"), so the question genuinely
+had two possible answers — Copilot's is the other one. Adding it here would
+have double-counted, and the earlier draft of `split_tokens()` did exactly
+that for any details blob that ever grew a `reasoning` entry. Removed.
+
+So the details partition cleanly: `input + cache_read + cache_write =
+input_tokens`, and `output = output_tokens`. The run confirms both halves —
+2 + 0 + 21487 = 21489 — on a third row and a second model. `tests/run` now
+asserts the output half and the absence of a `reasoning` type against the
+real database too.
+
+The same row confirms the credit unit from §4 in passing:
+5389150000 / 1e9 = 5.389, and the CLI's footer read `AI Credits 5.39`.
 
 ### AI credits — a real, native cost unit
 

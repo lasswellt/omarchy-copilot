@@ -189,11 +189,16 @@ def split_tokens(row: dict[str, Any]) -> tuple[int, int, int, int]:
   request whose details say 3 uncached input and 15802 cache_write — so
   reading them as if they were disjoint counts the cache twice.
 
-  Reasoning tokens ride in the output bucket, which the record contract has
-  no separate slot for. In the details path they are a disjoint entry and so
-  are added; in the fallback path output_tokens is assumed inclusive of them
-  by the same symmetry that makes input_tokens inclusive. If a row ever
-  shows details whose types do not sum to the flat columns, the details win.
+  Reasoning tokens need no handling at all: they are already inside the
+  output count, in every representation Copilot offers. Measured on a
+  `--reasoning-effort high` run that produced 13 of them — `output_tokens`
+  read 17, `token_details_json` carried an `output` entry of 17 and no
+  `reasoning` entry, and the CLI's own footer printed `↓ 17 (13 reasoning)`.
+  Adding `reasoning_tokens` to the output bucket would count them twice.
+
+  So the details partition cleanly into input / cache_read / cache_write /
+  output, with `input_tokens` covering the first three and `output_tokens`
+  the last. Where the two disagree, the details win.
   """
   details: Any = None
   raw = row.get("token_details_json")
@@ -214,7 +219,7 @@ def split_tokens(row: dict[str, Any]) -> tuple[int, int, int, int]:
     if by_type:
       return (
         by_type.get("input", 0),
-        by_type.get("output", 0) + by_type.get("reasoning", 0),
+        by_type.get("output", 0),
         by_type.get("cache_read", 0),
         by_type.get("cache_write", 0),
       )

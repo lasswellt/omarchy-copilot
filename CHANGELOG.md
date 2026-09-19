@@ -24,13 +24,22 @@ carried no data.
   nothing to report.
 - AI credits in the record (`aiCredits`), rated from `total_nano_aiu`. Beyond
   the contract and ignored by the built-in panel; shown in ours.
-- `tests/run` (1131 checks) and `tests/lint`. The tests speak the real
+- `tests/run` (1199 checks) and `tests/lint`. The tests speak the real
   JSON-RPC framing through `tests/fake-copilot` rather than mocking the
   client, and assert the token identity the mapping rests on against the real
   database when one is present.
 - `refreshIntervalSec` setting, read by both surfaces from one place.
 - `omarchy-shell lasswellt.copilot status` — the headline numbers as JSON,
   off the record already in memory, for prompt segments and polling scripts.
+
+### Measured
+
+- `output_tokens` already includes `reasoning_tokens`, so reasoning is never
+  added to the output bucket. A `--reasoning-effort high` run produced 13
+  reasoning tokens inside an `output_tokens` of 17, with no `reasoning` entry
+  in `token_details_json` and the CLI's own footer reading `↓ 17 (13
+  reasoning)`. The first draft would have double-counted them. `tests/run`
+  now asserts this against the real database on every run.
 
 ### Fixed, versus the plan in `findings.md`
 
