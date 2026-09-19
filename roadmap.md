@@ -5,9 +5,12 @@ Copilot keeps data on disk*; this describes *what shape the plugin should
 take and what's left to build*. It also corrects `findings.md`, which aimed
 the collector at the wrong data source.
 
-**Status, 2026-09-18 evening: built.** Everything in §8 below is checked off
-except the assets and a screenshot, and the Agents-panel tab was confirmed
-rendering on this machine (see §9). What follows is kept as the derivation —
+**Status, 2026-09-18 evening: built, installed, and published.** Everything
+in §8 is checked off bar three notes: a `preview.png`, a test for a database
+locked mid-write, and the SVG mark, which is closed rather than pending
+because nothing can consume it. The Agents-panel tab was confirmed rendering
+on this machine (see §9). One correctness question is still open — §4, on
+whether `output_tokens` already includes `reasoning_tokens`. What follows is kept as the derivation —
 why each field is read the way it is — not as a plan.
 
 The headline: **Copilot ships its own JSON-RPC server, its own JSON Schema
@@ -403,13 +406,15 @@ It reads the *published record*, not the collector — the same file the Agents
 panel reads — so the two views cannot disagree. Opening it asks for
 `--limits-only` (fresh quota, reused disk scan); `r` forces a full rescan.
 
-### Assets — still open
-- [ ] An SVG mark + `-light` twin. Only this plugin's own panel could use
-      one; the Agents panel resolves marks inside its own root-owned
-      directory. The current panel uses a Nerd Font GitHub glyph, which needs
-      no vendoring and no trademark question. An SVG is an improvement, not a
-      gap
-- [ ] `preview.png` for the README
+### Assets
+- [~] An SVG mark + `-light` twin. **Closed, not done.** It has no consumer:
+      the Agents panel resolves marks inside its own root-owned directory, so
+      ours could never land there, and this plugin's own panel draws a Nerd
+      Font GitHub glyph that needs no vendoring and raises no trademark
+      question. Reopen it only if the panel grows a surface a glyph cannot
+      serve
+- [ ] `preview.png` for the README. Cosmetic; the README no longer references
+      one, so it is an addition rather than a hole
 
 ### Tests
 - [x] Record-contract assertion over collector output, in every case
@@ -434,9 +439,11 @@ panel reads — so the two views cannot disagree. Opening it asks for
 - [x] README from "scaffold" to what it shows, how it works, settings,
       commands, tests, and known limits
 - [x] `CHANGELOG.md`. No `THIRD_PARTY_NOTICES.md`: nothing is vendored
-- [ ] Push to the declared homepage so `omarchy plugin add <git url>` works.
-      The installed clone's `origin` is this directory, not GitHub, so the
-      local dev loop never needed it — but the README's install line does
+- [x] Push to the declared homepage so `omarchy plugin add <git url>` works.
+      Verified by cloning the pushed repo fresh and running
+      `omarchy-plugin-validate`, `tests/run` and `tests/lint` against the
+      clone. The installed copy's `origin` is still this directory, which is
+      what the local dev loop wants
 
 ## 9. What was built, in order
 
