@@ -129,6 +129,25 @@ Panel {
     return raw && typeof raw === "object" ? raw : null
   }
 
+  // What this machine spent of the account-wide premium allowance. The meter
+  // above counts every device and the IDE too; this is the part that was us.
+  readonly property var premium: {
+    var raw = value("premiumRequests", null)
+    return raw && typeof raw === "object" ? raw : null
+  }
+
+  readonly property var workspaces: {
+    var raw = value("workspaces", [])
+    return Array.isArray(raw) ? raw : []
+  }
+
+  readonly property real workspacePeak: {
+    var peak = 0
+    for (var i = 0; i < workspaces.length; i++)
+      peak = Math.max(peak, numberValue(workspaces[i] ? workspaces[i].tokens : 0))
+    return peak
+  }
+
   // Nothing to report, nothing in the bar. Bar.qml collapses a slot whose
   // item is invisible, so a machine that has never run Copilot draws nothing
   // and the icon arrives on its own after the first scan finds usage.
@@ -157,6 +176,23 @@ Panel {
     if (amount >= 100) return String(Math.round(amount))
     if (amount >= 10) return amount.toFixed(1)
     return amount.toFixed(2)
+  }
+
+  // Premium requests are fractional by design — a cheaper model costs a
+  // fraction of one — so a whole number stays whole and the rest keeps two
+  // places rather than pretending to a precision it does not have.
+  function formatRequests(value) {
+    var amount = Number(value)
+    if (!isFinite(amount) || amount <= 0) return "0"
+    return amount === Math.round(amount) ? String(Math.round(amount)) : amount.toFixed(2)
+  }
+
+  function formatAgo(stamp) {
+    var at = Date.parse(String(stamp || ""))
+    if (!isFinite(at)) return ""
+    var ageMs = Math.max(0, root.nowMs - at)
+    if (ageMs < 90000) return "just now"
+    return formatDuration(ageMs) + " ago"
   }
 
   function formatDuration(ms) {
@@ -211,6 +247,17 @@ Panel {
     var prompts = numberValue(value("todayPrompts", 0))
     var sessions = numberValue(value("todaySessions", 0))
     return tokens + " tokens · " + prompts + " prompts · " + sessions + " sessions"
+  }
+
+  function workspaceTooltip(space) {
+    if (!space) return ""
+    var sessions = numberValue(space.sessions)
+    var prompts = numberValue(space.prompts)
+    var parts = [sessions + (sessions === 1 ? " session" : " sessions"),
+                 prompts + (prompts === 1 ? " prompt" : " prompts"),
+                 formatTokenCount(numberValue(space.tokens)) + " tokens"]
+    if (space.branch) parts.push("on " + String(space.branch))
+    return parts.join(" · ")
   }
 
   function modelTooltip(row) {
@@ -299,6 +346,9 @@ Panel {
         todayPrompts: root.numberValue(root.value("todayPrompts", 0)),
         todayTokens: root.numberValue(root.value("todayTotalTokens", 0)),
         creditsToday: root.credits ? Number(root.credits.today) : 0,
+        premiumToday: root.premium ? Number(root.premium.today) : 0,
+        premiumTotal: root.premium ? Number(root.premium.total) : 0,
+        workspace: root.workspaces.length > 0 ? String(root.workspaces[0].name || "") : "",
         status: root.statusText,
         updatedAt: String(root.value("updatedAt", ""))
       })
@@ -450,56 +500,79 @@ Panel {
             }
           }
 
-          // ---------- AI credits ----------
+          // ---------- This machine ----------
+          //
+          // The meter above is account-wide: it counts the IDE, the web, and
+          // every other machine. These two are only what happened here, which
+          // is the question the meter cannot answer and the reason this panel
+          // exists next to the built-in one.
           PanelSeparator {
-            visible: creditsSection.visible
+            visible: localSection.visible
             foreground: root.foreground
           }
 
           Column {
-            id: creditsSection
-            visible: !!root.credits && root.numberValue(root.credits.total) > 0
+            id: localSection
+            visible: (!!root.credits && root.numberValue(root.credits.total) > 0)
+              || (!!root.premium && root.numberValue(root.premium.total) > 0)
             width: parent.width
             spacing: Style.spacing.md
 
             PanelSectionHeader {
               width: parent.width
-              text: "AI CREDITS"
+              text: "THIS MACHINE"
               foreground: root.foreground
               fontFamily: root.fontFamily
             }
 
-            Item {
+            StatRow {
+              width: localSection.width
+              visible: !!root.premium && root.numberValue(root.premium.total) > 0
+              label: "Premium requests"
+              value: root.premium
+                ? root.formatRequests(root.premium.today) + " today · "
+                  + root.formatRequests(root.premium.total) + " all time"
+                : ""
+            }
+
+            StatRow {
+              width: localSection.width
+              visible: !!root.credits && root.numberValue(root.credits.total) > 0
+              label: "AI credits"
+              value: root.credits
+                ? root.formatCredits(root.credits.today) + " today · "
+                  + root.formatCredits(root.credits.total) + " all time"
+                : ""
+            }
+          }
+
+          // ---------- Workspaces ----------
+          PanelSeparator {
+            visible: workspacesSection.visible
+            foreground: root.foreground
+          }
+
+          Column {
+            id: workspacesSection
+            visible: root.workspaces.length > 0
+            width: parent.width
+            spacing: Style.spacing.md
+
+            PanelSectionHeader {
               width: parent.width
-              implicitHeight: Math.max(creditsLabel.implicitHeight, creditsValue.implicitHeight)
+              text: "WORKSPACES"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
 
-              Text {
-                id: creditsLabel
-                textFormat: Text.PlainText
-                text: "Rated cost on this machine"
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideRight
-                anchors.left: parent.left
-                anchors.right: creditsValue.left
-                anchors.rightMargin: Style.spacing.sm
-                anchors.verticalCenter: parent.verticalCenter
-              }
+            Repeater {
+              model: root.workspaces
 
-              Text {
-                id: creditsValue
-                textFormat: Text.PlainText
-                text: root.credits
-                  ? root.formatCredits(root.credits.today) + " today · "
-                    + root.formatCredits(root.credits.total) + " all time"
-                  : ""
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
+              WorkspaceRow {
+                required property var modelData
+                width: workspacesSection.width
+                space: modelData
+                share: root.numberValue(modelData.tokens) / Math.max(1, root.workspacePeak)
               }
             }
           }
@@ -646,6 +719,113 @@ Panel {
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
+    }
+  }
+
+  // A label on the left, a figure on the right. Two of these carry the
+  // machine-local numbers that have no meter of their own.
+  component StatRow: Item {
+    id: statRow
+    property string label: ""
+    property string value: ""
+
+    implicitHeight: visible ? Math.max(statLabel.implicitHeight, statValue.implicitHeight) : 0
+
+    Text {
+      id: statLabel
+      textFormat: Text.PlainText
+      text: statRow.label
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+      anchors.left: parent.left
+      anchors.right: statValue.left
+      anchors.rightMargin: Style.spacing.sm
+      anchors.verticalCenter: parent.verticalCenter
+    }
+
+    Text {
+      id: statValue
+      textFormat: Text.PlainText
+      text: statRow.value
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      font.bold: true
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+    }
+  }
+
+  // Where the work happened: the repository, the branch it was last on, and
+  // how long ago. Sessions outside a repository show their directory name.
+  component WorkspaceRow: Item {
+    id: workspaceRow
+    property var space: null
+    property real share: 0
+
+    implicitHeight: spaceName.implicitHeight + Style.spacing.lg
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      color: root.alpha(root.foreground, 0.05)
+    }
+
+    Rectangle {
+      anchors.left: parent.left
+      anchors.top: parent.top
+      anchors.bottom: parent.bottom
+      width: parent.width * root.clamp(workspaceRow.share, 0, 1)
+      radius: Style.cornerRadius
+      color: root.alpha(root.foreground, 0.14)
+
+      Behavior on width {
+        NumberAnimation { duration: 160; easing.type: Easing.OutCubic }
+      }
+    }
+
+    Text {
+      id: spaceName
+      textFormat: Text.PlainText
+      // The owner prefix is the least interesting half of "owner/name" and
+      // the first to go when the row runs out of room.
+      text: workspaceRow.space ? String(workspaceRow.space.name || "") : ""
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      elide: Text.ElideLeft
+      anchors.left: parent.left
+      anchors.leftMargin: Style.space(8)
+      anchors.right: spaceAgo.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+    }
+
+    Text {
+      id: spaceAgo
+      textFormat: Text.PlainText
+      text: workspaceRow.space ? root.formatAgo(workspaceRow.space.lastActive) : ""
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      anchors.right: parent.right
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+    }
+
+    MouseArea {
+      id: spaceHover
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: Qt.NoButton
+    }
+
+    PanelToolTip {
+      visible: spaceHover.containsMouse
+      text: root.workspaceTooltip(workspaceRow.space)
+      fontFamily: root.fontFamily
     }
   }
 

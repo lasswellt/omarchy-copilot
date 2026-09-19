@@ -95,6 +95,8 @@ def install_stub() -> None:
 
 REQUIRED_KEYS = {
   "aiCredits": dict,
+  "premiumRequests": dict,
+  "workspaces": list,
   "schemaVersion": int, "id": str, "name": str, "updatedAt": str,
   "ready": bool, "hasLocalStats": bool, "hasPromptStats": bool,
   "todayPrompts": int, "todaySessions": int, "todayTotalTokens": int,
@@ -215,6 +217,12 @@ def main() -> int:
           f"{bucket_b['outputTokens']} — output already contains the 20 reasoning tokens")
 
     today_total = sum(record["todayTokensByModel"].values())
+    # Every happy-path event is user-initiated at 1x, the only combination
+    # real rows have shown, so three events cost three premium requests —
+    # two of them today.
+    check("happy/premiumRequests counts user-initiated multipliers",
+          record["premiumRequests"] == {"today": 2.0, "total": 3.0},
+          json.dumps(record["premiumRequests"]))
     check("happy/aiCredits rated from nano units",
           record["aiCredits"] == {"today": 1.5, "total": 4.0},
           json.dumps(record["aiCredits"]))
@@ -225,6 +233,117 @@ def main() -> int:
           f"{recent.get(today)} vs {record['todayTotalTokens']}")
     check("happy/recentDays carries yesterday", recent.get(yesterday) == 15811,
           str(recent.get(yesterday)))
+
+    # ------------------------------------------------- premium requests
+    #
+    # Copilot's schema calls this "user-initiated premium request cost (with
+    # multiplier applied)". Both halves of that matter: a call the agent made
+    # on its own is nobody's premium request, and a cheaper model costs a
+    # fraction of one.
+    home = fixtures.build_home(
+      tmp / "premium",
+      sessions=[("s1", "x", fixtures.utc_stamp(noon_today), fixtures.utc_stamp(noon_today))],
+      turns=[("s1", 0, "hi", fixtures.utc_stamp(noon_today))],
+      events=[
+        ("s1", model_a, 100, 10, 0, 0, 0, None, fixtures.utc_stamp(noon_today), 0, "user", 1.0),
+        ("s1", model_a, 100, 10, 0, 0, 0, None, fixtures.utc_stamp(noon_today), 0, "user", 0.33),
+        # An agent-initiated call: real work, real tokens, not a premium request.
+        ("s1", model_a, 100, 10, 0, 0, 0, None, fixtures.utc_stamp(noon_today), 0, "agent", 1.0),
+        # A row with no multiplier recorded contributes nothing rather than
+        # silently counting as one.
+        ("s1", model_a, 100, 10, 0, 0, 0, None, fixtures.utc_stamp(noon_today), 0, "user", None),
+      ])
+    record = run(home, scenario=scenario)
+    check_contract("premium", record)
+    check("premium/sums user-initiated multipliers only",
+          record["premiumRequests"] == {"today": 1.33, "total": 1.33},
+          json.dumps(record["premiumRequests"]))
+    check("premium/agent-initiated tokens still counted",
+          record["modelUsage"][model_a]["inputTokens"] == 400,
+          str(record["modelUsage"][model_a]["inputTokens"]))
+
+    # ----------------------------------------------------------- workspaces
+    repo_a, repo_b = "lasswellt/omarchy-copilot", "acme/api"
+    earlier = noon_today - timedelta(hours=3)
+    home = fixtures.build_home(
+      tmp / "workspaces",
+      sessions=[
+        # Two sessions in one repository, on different branches.
+        ("r1", "a", fixtures.utc_stamp(earlier), fixtures.utc_stamp(earlier),
+         "/home/u/Projects/omarchy-copilot", repo_a, "old-branch"),
+        ("r2", "b", fixtures.utc_stamp(noon_today), fixtures.utc_stamp(noon_today),
+         "/home/u/Projects/omarchy-copilot", repo_a, "master"),
+        # A second repository.
+        ("r3", "c", fixtures.utc_stamp(earlier), fixtures.utc_stamp(earlier),
+         "/home/u/work/api", repo_b, "main"),
+        # Two directories that are not repositories and share a basename.
+        # Grouping on the basename would merge them; grouping on the full
+        # path keeps them apart while still displaying the short name.
+        ("d1", "d", fixtures.utc_stamp(earlier), fixtures.utc_stamp(earlier),
+         "/home/u/one/scratch", None, None),
+        ("d2", "e", fixtures.utc_stamp(earlier), fixtures.utc_stamp(earlier),
+         "/home/u/two/scratch", None, None),
+        # Housekeeping: a session with no turns and no usage is not work.
+        ("h1", None, fixtures.utc_stamp(noon_today), fixtures.utc_stamp(noon_today),
+         "/home/u/Projects/omarchy-copilot", repo_a, "master"),
+      ],
+      turns=[("r1", 0, "hi", fixtures.utc_stamp(earlier)),
+             ("r2", 0, "hi", fixtures.utc_stamp(noon_today)),
+             ("r2", 1, "again", fixtures.utc_stamp(noon_today)),
+             ("r3", 0, "hi", fixtures.utc_stamp(earlier)),
+             ("d1", 0, "hi", fixtures.utc_stamp(earlier)),
+             ("d2", 0, "hi", fixtures.utc_stamp(earlier))],
+      events=[("r2", model_a, 100, 10, 0, 0, 0,
+               fixtures.token_details(model_a, 100, 0, 0, 10), fixtures.utc_stamp(noon_today))])
+    record = run(home, scenario=scenario)
+    check_contract("workspaces", record)
+    spaces = record["workspaces"]
+    by_name = {w["name"]: w for w in spaces}
+
+    check("workspaces/most recent first",
+          spaces and spaces[0]["name"] == repo_a, json.dumps([w["name"] for w in spaces]))
+    check("workspaces/repository sessions merge",
+          by_name.get(repo_a, {}).get("sessions") == 2,
+          json.dumps(by_name.get(repo_a)))
+    check("workspaces/housekeeping session not counted",
+          by_name.get(repo_a, {}).get("prompts") == 3,
+          "2 turns in r2 + 1 in r1, and nothing from h1")
+    check("workspaces/branch is the most recent one",
+          by_name.get(repo_a, {}).get("branch") == "master",
+          str(by_name.get(repo_a, {}).get("branch")))
+    check("workspaces/repository carried through",
+          by_name.get(repo_a, {}).get("repository") == repo_a)
+    check("workspaces/tokens attributed to the right repo",
+          by_name.get(repo_a, {}).get("tokens") == 110,
+          str(by_name.get(repo_a, {}).get("tokens")))
+    check("workspaces/second repository present", repo_b in by_name,
+          json.dumps(sorted(by_name)))
+
+    scratch = [w for w in spaces if w["name"] == "scratch"]
+    check("workspaces/same basename stays two entries", len(scratch) == 2,
+          f"{len(scratch)} entries named scratch")
+    check("workspaces/non-repo entries carry no repository",
+          all(w["repository"] is None for w in scratch))
+
+    # A machine that has only ever run Copilot outside a repository still
+    # gets a usable list.
+    record = run(fixtures.build_home(
+      tmp / "norepo",
+      sessions=[("s1", "x", fixtures.utc_stamp(noon_today), fixtures.utc_stamp(noon_today),
+                 "/home/u/notes", None, None)],
+      turns=[("s1", 0, "hi", fixtures.utc_stamp(noon_today))],
+      events=[]), scenario=scenario)
+    check_contract("norepo", record)
+    check("norepo/displays the directory name",
+          record["workspaces"] and record["workspaces"][0]["name"] == "notes",
+          json.dumps(record["workspaces"]))
+
+    # No database, no workspaces — and no crash.
+    record = run(fixtures.build_home(tmp / "nodb2", with_db=False), scenario=scenario)
+    check("nodb/workspaces empty", record["workspaces"] == [])
+    check("nodb/premiumRequests zeroed",
+          record["premiumRequests"] == {"today": 0.0, "total": 0.0},
+          json.dumps(record["premiumRequests"]))
 
     # -------------------------------- a token type the collector has not seen
     #

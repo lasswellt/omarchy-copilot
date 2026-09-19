@@ -174,6 +174,8 @@ def empty_stats() -> dict[str, Any]:
     "activeDates": [],
     "modelUsage": {},
     "aiCredits": {"today": 0.0, "total": 0.0},
+    "premiumRequests": {"today": 0.0, "total": 0.0},
+    "workspaces": [],
   }
 
 
@@ -255,6 +257,17 @@ def scan_database(db: Path) -> tuple[dict[str, Any], bool]:
   today_prompts = 0
   today_nano_aiu = 0
   total_nano_aiu = 0
+  today_premium = 0.0
+  total_premium = 0.0
+  # Per session, so the workspace rollup below can attribute each session's
+  # work to the repository it happened in.
+  per_session: dict[str, dict[str, Any]] = {}
+
+  def touch(session_id: str, stamp: str) -> dict[str, Any]:
+    entry = per_session.setdefault(session_id, {"prompts": 0, "tokens": 0, "lastActive": ""})
+    if stamp > entry["lastActive"]:
+      entry["lastActive"] = stamp
+    return entry
 
   try:
     # Read-only, and never a writer: Copilot may be mid-turn right now. The
@@ -270,7 +283,8 @@ def scan_database(db: Path) -> tuple[dict[str, Any], bool]:
 
     for row in conn.execute(
       "SELECT session_id, model, input_tokens, output_tokens, cache_read_tokens,"
-      " cache_write_tokens, token_details_json, total_nano_aiu, created_at"
+      " cache_write_tokens, token_details_json, total_nano_aiu, initiator,"
+      " request_multiplier, created_at"
       " FROM assistant_usage_events"
     ):
       entry = dict(row)
@@ -289,6 +303,23 @@ def scan_database(db: Path) -> tuple[dict[str, Any], bool]:
       nano_aiu = number(entry.get("total_nano_aiu"))
       total_nano_aiu += nano_aiu
 
+      # "User-initiated premium request cost (with multiplier applied)" is
+      # how Copilot's own schema defines this, so the initiator filter is the
+      # definition rather than a guess: a model call the agent made on its
+      # own is not a premium request anybody is billed for. Fractional by
+      # design — a 0.33x model costs a third of one.
+      premium = 0.0
+      if str(entry.get("initiator") or "") == "user":
+        try:
+          premium = max(0.0, float(entry.get("request_multiplier") or 0))
+        except (TypeError, ValueError):
+          premium = 0.0
+      total_premium += premium
+
+      if session_id:
+        stats_entry = touch(session_id, str(entry.get("created_at") or ""))
+        stats_entry["tokens"] += total
+
       if session_id:
         sessions.add(session_id)
       if total > 0:
@@ -298,6 +329,7 @@ def scan_database(db: Path) -> tuple[dict[str, Any], bool]:
       if day == today:
         today_total += total
         today_nano_aiu += nano_aiu
+        today_premium += premium
         if total > 0:
           today_by_model[model] = today_by_model.get(model, 0) + total
         if session_id:
@@ -314,10 +346,12 @@ def scan_database(db: Path) -> tuple[dict[str, Any], bool]:
       active_days.add(day)
       if session_id:
         sessions.add(session_id)
+        touch(session_id, str(entry.get("timestamp") or ""))["prompts"] += 1
       if day == today:
         today_prompts += 1
         if session_id:
           today_sessions.add(session_id)
+    workspaces = roll_up_workspaces(conn, per_session)
   except sqlite3.Error:
     # Transient lock, a schema migration, corruption: the numbers stop here,
     # incomplete. Serve what we read, cache none of it.
@@ -348,8 +382,72 @@ def scan_database(db: Path) -> tuple[dict[str, Any], bool]:
       "today": round(today_nano_aiu / 1e9, 4),
       "total": round(total_nano_aiu / 1e9, 4),
     },
+    # What this machine spent of the account-wide premium allowance. The
+    # meter in `limits` counts every device and the IDE too; this is the part
+    # that happened here.
+    "premiumRequests": {
+      "today": round(today_premium, 2),
+      "total": round(total_premium, 2),
+    },
+    "workspaces": workspaces,
   })
   return stats, True
+
+
+def roll_up_workspaces(conn: sqlite3.Connection, per_session: dict[str, dict[str, Any]],
+                       limit: int = 8) -> list[dict[str, Any]]:
+  """Recent activity, grouped by the repository each session ran in.
+
+  `sessions.repository` is a string derived from the git remote — "owner/name"
+  for GitHub, "org/project/repo" for Azure DevOps — and is null outside a
+  repository. Sessions with no repository group by their full working
+  directory rather than its basename, so two different checkouts both called
+  `api` stay apart, and display as the basename.
+  """
+  if not per_session:
+    return []
+
+  groups: dict[str, dict[str, Any]] = {}
+  for row in conn.execute("SELECT id, cwd, repository, branch, updated_at FROM sessions"):
+    entry = dict(row)
+    session_id = str(entry.get("id") or "")
+    counted = per_session.get(session_id)
+    if not counted:
+      # A session with no turns and no usage is housekeeping, not work.
+      continue
+
+    repository = str(entry.get("repository") or "").strip()
+    cwd = str(entry.get("cwd") or "").strip()
+    if repository:
+      key, name = "repo:" + repository, repository
+    elif cwd:
+      key, name = "dir:" + cwd, cwd.rstrip("/").rsplit("/", 1)[-1] or cwd
+    else:
+      key, name = "unknown", "unknown"
+
+    group = groups.setdefault(key, {
+      "name": name,
+      "repository": repository or None,
+      "branch": None,
+      "sessions": 0,
+      "prompts": 0,
+      "tokens": 0,
+      "lastActive": "",
+    })
+    group["sessions"] += 1
+    group["prompts"] += counted["prompts"]
+    group["tokens"] += counted["tokens"]
+
+    # The branch shown is the one the most recent session in this workspace
+    # used; a repository worked on from several branches has no single answer.
+    last_active = counted["lastActive"] or str(entry.get("updated_at") or "")
+    if last_active > group["lastActive"]:
+      group["lastActive"] = last_active
+      branch = str(entry.get("branch") or "").strip()
+      group["branch"] = branch or None
+
+  ordered = sorted(groups.values(), key=lambda group: group["lastActive"], reverse=True)
+  return ordered[:limit]
 
 
 # -------------------------------------------------------------- scan cache

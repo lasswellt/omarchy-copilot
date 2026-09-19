@@ -90,18 +90,25 @@ def build_home(root: Path, sessions=(), turns=(), events=(), with_db: bool = Tru
   try:
     conn.executescript(SCHEMA)
     conn.executemany(
-      "INSERT INTO sessions (id, summary, created_at, updated_at) VALUES (?, ?, ?, ?)", sessions)
+      "INSERT INTO sessions (id, summary, created_at, updated_at, cwd, repository, branch)"
+      " VALUES (?, ?, ?, ?, ?, ?, ?)",
+      # cwd / repository / branch are optional in the fixtures: a session
+      # started outside a git repository has them null, which is the common
+      # case and the one the workspace rollup has to survive.
+      [tuple(row) + (None,) * (7 - len(row)) for row in sessions])
     conn.executemany(
       "INSERT INTO turns (session_id, turn_index, user_message, timestamp) VALUES (?, ?, ?, ?)", turns)
     conn.executemany(
       "INSERT INTO assistant_usage_events"
       " (session_id, model, input_tokens, output_tokens, cache_read_tokens,"
       "  cache_write_tokens, reasoning_tokens, token_details_json, created_at,"
-      "  total_nano_aiu)"
-      " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      # total_nano_aiu is optional in the fixtures: a row that omits it is a
-      # row Copilot did not rate, and the collector must survive that.
-      [tuple(row) + (None,) * (10 - len(row)) for row in events])
+      "  total_nano_aiu, initiator, request_multiplier)"
+      " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      # The trailing three are optional. total_nano_aiu omitted is a row
+      # Copilot did not rate; initiator and request_multiplier default to the
+      # only combination observed on real rows, a user-initiated call at 1x.
+      [tuple(row) + (None,) * (10 - len(row)) + (("user", 1.0) if len(row) <= 10 else ())
+       for row in events])
     conn.commit()
   finally:
     conn.close()
